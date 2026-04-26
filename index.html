@@ -1,0 +1,168 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Pointy Clouds ADMM Hubs</title>
+    <link rel="preconnect" href="https://fonts.googleapis.com" />
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+    <link
+      href="https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@400;500;700&family=IBM+Plex+Mono:wght@400;500&display=swap"
+      rel="stylesheet"
+    />
+    <link rel="stylesheet" href="./styles.css" />
+  </head>
+  <body>
+    <div class="shell">
+      <header class="hero">
+        <div class="hero-copy">
+          <p class="eyebrow">Point Cloud Optimisation</p>
+          <div class="mode-switch" role="tablist" aria-label="Solver modes">
+            <button id="explorerTab" class="mode-tab is-active" type="button">ADMM Explorer</button>
+            <button id="tuningTab" class="mode-tab" type="button">Hub Tuning</button>
+            <button id="canvasTab" class="mode-tab" type="button">Canvas Solve</button>
+          </div>
+          <h1>ADMM hubs minimised against fit, path smoothness, shrinkage, graph variation, and station cost.</h1>
+          <p id="modeSummary" class="lede">
+            The browser runs a 2D, deterministic ADMM-style solver over hub locations
+            <code>x, z₁, z₂, z₃, u₁, u₂, u₃</code>. Each frame updates the point assignments,
+            shortest-path regulariser, quadratic shrinkage, graph total variation, and a station-count penalty.
+          </p>
+        </div>
+        <div class="hero-math">
+          <p><code>f(x) = 1/2 Σᵢ Σᵧ∈I(xᵢ) ||y - xᵢ||²</code></p>
+          <p><code>g₁(z₁) = weighted path smoothness on shortest hub paths</code></p>
+          <p><code>g₂(z₂) = λ ||z₂||²</code></p>
+          <p><code>g₃(z₃) = μ Σ(i,j)∈E ||z₃,i - z₃,j||</code></p>
+          <p><code>g₄(x) = c_station · |stations|</code></p>
+        </div>
+      </header>
+
+      <main class="layout">
+        <section class="panel viz-panel">
+          <div class="panel-head">
+            <div>
+              <p class="panel-kicker">Live Geometry</p>
+              <h2>Point cloud, hub graph, and selected ADMM route pressure</h2>
+            </div>
+            <div class="badge-row">
+              <span class="badge"><span class="swatch cloud"></span>Points</span>
+              <span class="badge"><span class="swatch hub"></span>Hubs</span>
+              <span class="badge"><span class="swatch route"></span>High-weight paths</span>
+            </div>
+          </div>
+          <div class="scene-shell">
+            <canvas id="scene" width="960" height="660" aria-label="ADMM point cloud visualisation"></canvas>
+            <div class="map-controls map-controls-pan" aria-label="Map navigation controls">
+              <button id="panUp" class="map-button ghost" type="button" aria-label="Pan up">↑</button>
+              <div class="map-controls-row">
+                <button id="panLeft" class="map-button ghost" type="button" aria-label="Pan left">←</button>
+                <button id="panDown" class="map-button ghost" type="button" aria-label="Pan down">↓</button>
+                <button id="panRight" class="map-button ghost" type="button" aria-label="Pan right">→</button>
+              </div>
+            </div>
+            <div class="map-controls map-controls-zoom" aria-label="Map zoom controls">
+              <button id="zoomIn" class="map-button" type="button" aria-label="Zoom in">+</button>
+              <button id="zoomOut" class="map-button ghost" type="button" aria-label="Zoom out">−</button>
+            </div>
+          </div>
+        </section>
+
+        <section class="sidebar">
+          <div class="panel controls-panel">
+            <div class="panel-head">
+              <div>
+                <p class="panel-kicker">Controls</p>
+                <h2>Solver</h2>
+              </div>
+            </div>
+            <div class="button-row">
+              <button id="playPause">Pause</button>
+              <button id="stepButton" class="ghost">Step</button>
+              <button id="resetButton" class="ghost">Reset</button>
+              <button id="randomizeButton" class="ghost">Randomise</button>
+              <button id="voronoiToggle" class="ghost" type="button">Show Voronoi</button>
+            </div>
+            <div id="canvasSolverGroup" class="solver-toggle is-hidden">
+              <span class="solver-toggle-label">Canvas solver</span>
+              <div class="solver-toggle-buttons" role="group" aria-label="Canvas solver mode">
+                <button id="canvasExplorerMode" class="solver-mode is-active" type="button">ADMM Explorer</button>
+                <button id="canvasTuningMode" class="solver-mode" type="button">Hub Tuning</button>
+              </div>
+            </div>
+            <div id="hubCountGroup" class="slider-group">
+              <label for="hubCount">Hub count <span id="hubCountValue" class="slider-value" role="button" tabindex="0" title="Click to enter a custom value">9</span></label>
+              <input id="hubCount" type="range" min="4" max="20" value="9" />
+            </div>
+            <div class="slider-group">
+              <label for="rho">ρ penalty <span id="rhoValue" class="slider-value" role="button" tabindex="0" title="Click to enter a custom value">1.15</span></label>
+              <input id="rho" type="range" min="0.3" max="5" step="0.05" value="1.15" />
+            </div>
+            <div class="slider-group">
+              <label for="lambda">λ shrinkage <span id="lambdaValue" class="slider-value" role="button" tabindex="0" title="Click to enter a custom value">0.12</span></label>
+              <input id="lambda" type="range" min="0" max="0.45" step="0.01" value="0.12" />
+            </div>
+            <div class="slider-group">
+              <label for="mu">μ graph TV <span id="muValue" class="slider-value" role="button" tabindex="0" title="Click to enter a custom value">0.26</span></label>
+              <input id="mu" type="range" min="0.00" max="100" step="0.02" value="0.26" />
+            </div>
+            <div class="slider-group">
+              <label for="stationCost">Station cost <span id="stationCostValue" class="slider-value" role="button" tabindex="0" title="Click to enter a custom value">0.00</span></label>
+              <input id="stationCost" type="range" min="0" max="100" step="0.25" value="0" />
+            </div>
+          </div>
+
+          <div class="metrics-grid">
+            <article class="metric-card">
+              <span class="metric-label">Iteration</span>
+              <strong id="iterValue">0</strong>
+            </article>
+            <article class="metric-card">
+              <span class="metric-label">Objective</span>
+              <strong id="objectiveValue">0.000</strong>
+            </article>
+            <article class="metric-card">
+              <span class="metric-label">Primal residual</span>
+              <strong id="primalValue">0.000</strong>
+            </article>
+            <article class="metric-card">
+              <span class="metric-label">Dual residual</span>
+              <strong id="dualValue">0.000</strong>
+            </article>
+          </div>
+
+          <div class="panel charts-panel">
+            <div class="panel-head">
+              <div>
+                <p class="panel-kicker">History</p>
+                <h2>Energy and residual trends</h2>
+              </div>
+            </div>
+            <canvas id="objectiveChart" width="420" height="170"></canvas>
+            <canvas id="residualChart" width="420" height="170"></canvas>
+          </div>
+
+          <div class="panel details-panel">
+            <div class="panel-head">
+              <div>
+                <p class="panel-kicker">Term Breakdown</p>
+                <h2>Current subproblem values</h2>
+              </div>
+            </div>
+            <dl class="term-list">
+              <div><dt><code>f(x)</code></dt><dd id="fxValue">0.000</dd></div>
+              <div><dt><code>g₁(z₁)</code></dt><dd id="g1Value">0.000</dd></div>
+              <div><dt><code>g₂(z₂)</code></dt><dd id="g2Value">0.000</dd></div>
+              <div><dt><code>g₃(z₃)</code></dt><dd id="g3Value">0.000</dd></div>
+              <div><dt><code>g₄(x)</code></dt><dd id="g4Value">0.000</dd></div>
+              <div><dt id="weightLabel">Largest hub weight</dt><dd id="weightValue">0</dd></div>
+              <div><dt id="pathLabel">Highlighted path</dt><dd id="pathValue">0 → 0</dd></div>
+            </dl>
+          </div>
+        </section>
+      </main>
+    </div>
+
+    <script src="./app.js"></script>
+  </body>
+</html>
