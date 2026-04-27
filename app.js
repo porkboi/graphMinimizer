@@ -85,6 +85,11 @@ const sgdDefaults = {
   pairSamples: 12,
 };
 
+const admmDefaults = {
+  eta: 1e-3,
+  decay: 0.04,
+};
+
 function mulberry32(seed) {
   let t = seed >>> 0;
   return () => {
@@ -618,7 +623,8 @@ function proxX(state) {
     }
     const consensus = add(add(sub(state.z1[i], state.u1[i]), sub(state.z2[i], state.u2[i])), sub(state.z3[i], state.u3[i]));
     const denom = bucket.length + 3 * state.rho;
-    nextX.push(scale(add(sum, scale(consensus, 1e-6)), 1 / Math.max(denom, 1e-6)));
+    const eta = state.admmEta / Math.sqrt(1 + state.iteration * state.admmDecay);
+    nextX.push(scale(add(sum, scale(consensus, eta)), 1 / Math.max(denom, 1e-6)));
   }
   return nextX;
 }
@@ -649,8 +655,9 @@ function proxZ1(state, graph, weights) {
           const b = path[p + 1];
           const delta = sub(z[a], z[b]);
           const unit = normalize(delta);
-          grad[a] = add(grad[a], scale(unit, 1e-6*coeff));
-          grad[b] = add(grad[b], scale(unit, -1e-6*coeff));
+          const eta = state.admmEta / Math.sqrt(1 + state.iteration * state.admmDecay);
+          grad[a] = add(grad[a], scale(unit, eta*coeff));
+          grad[b] = add(grad[b], scale(unit, -eta*coeff));
         }
       }
     }
@@ -673,8 +680,9 @@ function proxZ3(state, edges) {
     for (const [a, b] of edges) {
       const delta = sub(z[a], z[b]);
       const unit = normalize(delta);
-      grad[a] = add(grad[a], scale(unit, 1e-6));
-      grad[b] = add(grad[b], scale(unit, -1e-6));
+      const eta = state.admmEta / Math.sqrt(1 + state.iteration * state.admmDecay);
+      grad[a] = add(grad[a], scale(unit, eta));
+      grad[b] = add(grad[b], scale(unit, -eta));
     }
     for (let i = 0; i < z.length; i += 1) {
       const proxGrad = add(grad[i], scale(sub(z[i], v[i]), state.rho));
@@ -803,6 +811,8 @@ function createBaseState(mode, cloud, x, edges) {
     tuningBaseline: null,
     tuningLastConvergence: null,
     tuningAcceptedContext: null,
+    admmEta: admmDefaults.eta,
+    admmDecay: admmDefaults.decay,
   };
   resetAdmmVariables(state, x, edges);
   return state;
@@ -953,8 +963,6 @@ function computeSgdGradient(x, cloud, params, rng, edges = null) {
   const grad = x.map(() => vec(0, 0));
   const batch = sampleWithoutReplacement(cloud, Math.min(params.sgdBatchSize, cloud.length), rng);
   const batchScale = cloud.length / Math.max(batch.length, 1);
-
-  console.log(params.rho, params.lambda, params.mu)
 
   for (const point of batch) {
     const best = nearestCenterIndex(point, x);
