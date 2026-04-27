@@ -796,9 +796,25 @@ function createBaseState(mode, cloud, x, edges) {
     history: [],
     lastAction: "Initialised",
     forceStop: false,
+    tuningPhase: null,
+    tuningPhaseData: null,
+    tuningBaseline: null,
+    tuningLastConvergence: null,
+    tuningAcceptedContext: null,
   };
   resetAdmmVariables(state, x, edges);
   return state;
+}
+
+function initializeTuningLoopState(state, lastAction) {
+  state.outerIteration = 0;
+  state.tuningPhase = "cycleStart";
+  state.tuningPhaseData = null;
+  state.tuningBaseline = null;
+  state.tuningLastConvergence = null;
+  state.tuningAcceptedContext = null;
+  state.forceStop = false;
+  state.lastAction = lastAction;
 }
 
 function createExplorerState() {
@@ -814,8 +830,7 @@ function createTuningState() {
   const clustering = kMeans(cloud, startK, 16, 111);
   const graph = buildMaxGraph(clustering.centers);
   const state = createBaseState("tuning", cloud, clustering.centers, graph.edges);
-  state.outerIteration = 0;
-  state.lastAction = `Start with ${startK} hubs from KMeans`;
+  initializeTuningLoopState(state, `Start with ${startK} hubs from KMeans`);
   return state;
 }
 
@@ -849,8 +864,12 @@ function createCanvasState(cloud = customCloud, solveMode = canvasSolveMode) {
 
   const state = createBaseState("canvas", points, x, edges);
   state.canvasSolveMode = solveMode;
-  state.outerIteration = 0;
-  state.lastAction = lastAction;
+  if (solveMode === "tuning") {
+    initializeTuningLoopState(state, lastAction);
+  } else {
+    state.outerIteration = 0;
+    state.lastAction = lastAction;
+  }
   return state;
 }
 
@@ -932,6 +951,8 @@ function computeSgdGradient(x, cloud, params, rng, edges = null) {
   const grad = x.map(() => vec(0, 0));
   const batch = sampleWithoutReplacement(cloud, Math.min(params.sgdBatchSize, cloud.length), rng);
   const batchScale = cloud.length / Math.max(batch.length, 1);
+
+  console.log(params.rho, params.lambda, params.mu)
 
   for (const point of batch) {
     const best = nearestCenterIndex(point, x);
@@ -1197,6 +1218,166 @@ function simulateFinalAdmmCompletion(baseState, x, edges) {
   return { state, metrics: completion.metrics, completion };
 }
 
+function getTuningConvergenceOptions(state, mode, graphMode) {
+  if (mode === "final") {
+    if (state.optimizer === "sgd") {
+      return {
+        maxIterations: 160,
+        minIterations: 20,
+        graphMode,
+        motionTolerance: 0.00025,
+        objectiveTolerance: 0.00025,
+      };
+    }
+    return {
+      maxIterations: 96,
+      minIterations: 12,
+      primalAbsTolerance: 0.00025,
+      primalRelTolerance: 0.002,
+      graphMode,
+    };
+  }
+
+  if (state.optimizer === "sgd") {
+    return {
+      maxIterations: 96,
+      minIterations: 12,
+      graphMode,
+      motionTolerance: 0.0005,
+      objectiveTolerance: 0.0005,
+    };
+  }
+  return {
+    maxIterations: 48,
+    minIterations: 6,
+    primalAbsTolerance: 0.0005,
+    primalRelTolerance: 0.004,
+    graphMode,
+  };
+}
+
+function startTuningConvergencePhase(state, phaseName, mode, graphMode, nextPhase, extra = {}) {
+  const options = getTuningConvergenceOptions(state, mode, graphMode);
+  const fixedEdges = graphMode === "knn" ? buildKnnGraph(state.x, 2).edges : canonicalizeEdges(state.edges);
+  state.edges = fixedEdges;
+  state.tuningPhase = phaseName;
+  state.tuningPhaseData = {
+    phaseName,
+    mode,
+    graphMode,
+    nextPhase,
+    fixedEdges,
+    iterations: 0,
+    ...options,
+    ...extra,
+  };
+}
+
+function beginTuningCycle(state) {
+  state.tuningBaseline = null;
+  state.tuningLastConvergence = null;
+  state.tuningAcceptedContext = null;
+  startTuningConvergencePhase(state, "settling", "regular", "knn", "evaluateSplit");
+  state.lastAction = `Outer step ${state.outerIteration + 1}: settling ${optimizerLabel(state.optimizer)} with ${state.x.length} hubs`;
+}
+
+function runSingleTuningConvergenceIteration(state) {
+  const data = state.tuningPhaseData;
+  if (!data) {
+    return null;
+  }
+
+  let latest;
+  let motion = null;
+  if (state.optimizer === "sgd") {
+    latest = runSgdIteration(state, data.graphMode, true, data.fixedEdges);
+    motion = latest.motion;
+  } else {
+    const previousX = clonePoints(state.x);
+    latest = runAdmmIteration(state, data.graphMode, true, data.fixedEdges);
+    motion = computeMotionStats(state.x, previousX);
+  }
+
+  data.iterations += 1;
+  let settled = false;
+  if (state.optimizer === "sgd") {
+    settled = motion.avg <= data.motionTolerance && latest.dual <= data.objectiveTolerance;
+  } else {
+    const thresholds = computeResidualThresholds(state, data.primalAbsTolerance, data.primalRelTolerance);
+    settled = latest.primal <= thresholds.primal && latest.dual <= thresholds.dual;
+  }
+
+  const finished = data.iterations >= data.maxIterations || (data.iterations >= data.minIterations && settled);
+  const result = {
+    ...latest,
+    motion,
+    settled,
+    iterations: data.iterations,
+    timedOut: false,
+  };
+
+  state.tuningLastConvergence = result;
+  return { result, finished };
+}
+
+function captureTuningBaseline(state, baselineFinalObjective) {
+  state.tuningBaseline = {
+    x: clonePoints(state.x),
+    edges: canonicalizeEdges(state.edges),
+    iteration: state.iteration,
+    weights: state.weights.slice(),
+    highlightedPath: [...state.highlightedPath],
+    highlightedPair: [...state.highlightedPair],
+    historyLength: state.history.length,
+    finalObjective: baselineFinalObjective,
+  };
+}
+
+function restoreTuningBaseline(state) {
+  const baseline = state.tuningBaseline;
+  if (!baseline) {
+    return;
+  }
+  resetAdmmVariables(state, baseline.x, baseline.edges);
+  state.iteration = baseline.iteration;
+  state.weights = baseline.weights;
+  state.highlightedPath = baseline.highlightedPath;
+  state.highlightedPair = baseline.highlightedPair;
+  state.history.length = baseline.historyLength;
+}
+
+function advanceTuningConvergencePhase(state) {
+  const step = runSingleTuningConvergenceIteration(state);
+  if (!step || !step.finished) {
+    return;
+  }
+
+  const data = state.tuningPhaseData;
+  const edgeOptimization = data.mode === "regular" && !data.edgeOptimized
+    ? optimizeEdgesForState(state, step.result.metrics)
+    : { improved: false, removedEdges: 0 };
+
+  if (data.mode === "regular" && edgeOptimization.improved) {
+    resetAdmmVariables(state, state.x, edgeOptimization.edges);
+    startTuningConvergencePhase(state, data.phaseName ?? "settlingFixed", data.mode, "fixed", data.nextPhase, {
+      edgeOptimized: true,
+      removedEdges: edgeOptimization.removedEdges,
+    });
+    state.lastAction = `Outer step ${state.outerIteration + 1}: pruned ${edgeOptimization.removedEdges} edges, continuing ${optimizerLabel(state.optimizer)} settle`;
+    return;
+  }
+
+  state.tuningLastConvergence = {
+    ...step.result,
+    edgeOptimization:
+      data.mode === "regular"
+        ? edgeOptimization
+        : { improved: false, removedEdges: data.removedEdges ?? 0 },
+  };
+  state.tuningPhase = data.nextPhase;
+  state.tuningPhaseData = null;
+}
+
 function buildSplitProposal(state) {
   const currentEval = evaluateObjective(state.x, state.edges, state.cloud, state);
   const clusterEnergies = computeClusterEnergies(currentEval.assignments, state.x);
@@ -1276,60 +1457,123 @@ function stepTuningState(state) {
     return;
   }
   syncStateParams(state);
-  let convergence = runConvergedOptimizationWithEdgeOptimization(state, { graphMode: "knn" });
-  const baselineX = clonePoints(state.x);
-  const baselineEdges = canonicalizeEdges(state.edges);
-  const baselineIteration = state.iteration;
-  const baselineWeights = state.weights.slice();
-  const baselineHighlightedPath = [...state.highlightedPath];
-  const baselineHighlightedPair = [...state.highlightedPair];
-  const baselineHistoryLength = state.history.length;
-  const baselineFinal = simulateFinalAdmmCompletion(state, baselineX, baselineEdges);
-  const baselineFinalObjective = baselineFinal.metrics.objective;
   const solverName = optimizerLabel(state.optimizer);
+  const animateSolver = state.optimizer === "admm";
 
-  state.outerIteration += 1;
+  if (!state.tuningPhase) {
+    initializeTuningLoopState(state, `Start tuning with ${state.x.length} hubs`);
+  }
 
-  const splitProposal = buildSplitProposal(state);
-  if (splitProposal && splitProposal.delta > 0) {
-    adoptSimulationState(
-      state,
-      splitProposal.simulation,
-      `Added hub from Voronoi split ${splitProposal.clusterIndex} via ${splitProposal.anchorIndex} (ΔF=${splitProposal.delta.toFixed(3)})`,
-    );
-    convergence = runConvergedOptimizationWithEdgeOptimization(state, { graphMode: "knn" });
-    const finalConvergence = runFinalAdmmCompletion(state);
-    if (finalConvergence.metrics.objective + 1e-6 < baselineFinalObjective || state.forceStop) {
-      const finalDelta = baselineFinalObjective - finalConvergence.metrics.objective;
-      const edgeNote = convergence.edgeOptimization.improved
-        ? `; pruned ${convergence.edgeOptimization.removedEdges} edges after convergence`
-        : "";
-      const completionLabel = finalConvergence.settled
-        ? `final ${solverName} completed in ${finalConvergence.iterations} steps`
-        : finalConvergence.timedOut
-          ? `final ${solverName} stopped at the runtime budget after ${finalConvergence.iterations} steps`
-          : `final ${solverName} hit the step cap after ${finalConvergence.iterations} steps`;
-      state.lastAction = `${state.lastAction}; settled in ${convergence.iterations} ${solverName} steps; ${completionLabel}; final ΔF=${finalDelta.toFixed(3)}${edgeNote}`;
-    } else {
-      resetAdmmVariables(state, baselineX, baselineEdges);
-      state.iteration = baselineIteration;
-      state.weights = baselineWeights;
-      state.highlightedPath = baselineHighlightedPath;
-      state.highlightedPair = baselineHighlightedPair;
-      state.history.length = baselineHistoryLength;
-      state.lastAction = `Rejected hub split at outer step ${state.outerIteration}; final ${solverName} objective rose from ${baselineFinalObjective.toFixed(3)} to ${finalConvergence.metrics.objective.toFixed(3)}`;
-      state.forceStop = true;
+  while (true) {
+    if (state.tuningPhase === "cycleStart") {
+      beginTuningCycle(state);
+      if (animateSolver) {
+        return;
+      }
+      continue;
     }
-  } else {
-    const settleLabel = convergence.settled ? "settled" : `hit the ${solverName} step cap`;
-    const finalConvergence = runFinalAdmmCompletion(state);
-    const completionLabel = finalConvergence.settled
-      ? `final ${solverName} completed in ${finalConvergence.iterations} steps`
-      : finalConvergence.timedOut
-        ? `final ${solverName} stopped at the runtime budget after ${finalConvergence.iterations} steps`
-        : `final ${solverName} hit the step cap after ${finalConvergence.iterations} steps`;
-    state.lastAction = `No improving hub split after ${settleLabel} at outer step ${state.outerIteration}; ${completionLabel}`;
-    state.playing = false;
+
+    if (state.tuningPhase === "settling" || state.tuningPhase === "settlingFixed" || state.tuningPhase === "finalizing") {
+      if (animateSolver) {
+        advanceTuningConvergencePhase(state);
+        return;
+      }
+      while (state.tuningPhase === "settling" || state.tuningPhase === "settlingFixed" || state.tuningPhase === "finalizing") {
+        advanceTuningConvergencePhase(state);
+      }
+      continue;
+    }
+
+    if (state.tuningPhase === "evaluateSplit") {
+      const baselineFinal = simulateFinalAdmmCompletion(state, clonePoints(state.x), canonicalizeEdges(state.edges));
+      captureTuningBaseline(state, baselineFinal.metrics.objective);
+      state.outerIteration += 1;
+
+      const splitProposal = buildSplitProposal(state);
+      if (splitProposal && splitProposal.delta > 0) {
+        adoptSimulationState(
+          state,
+          splitProposal.simulation,
+          `Added hub from Voronoi split ${splitProposal.clusterIndex} via ${splitProposal.anchorIndex} (ΔF=${splitProposal.delta.toFixed(3)})`,
+        );
+        startTuningConvergencePhase(state, "settling", "regular", "knn", "prepareAcceptedFinalization", {
+          acceptance: {
+            clusterIndex: splitProposal.clusterIndex,
+            anchorIndex: splitProposal.anchorIndex,
+            splitDelta: splitProposal.delta,
+          },
+        });
+        if (animateSolver) {
+          return;
+        }
+        continue;
+      }
+
+      startTuningConvergencePhase(state, "finalizing", "final", "knn", "completeNoSplit");
+      state.lastAction = `Outer step ${state.outerIteration}: no improving split, running final ${solverName} cleanup`;
+      if (animateSolver) {
+        return;
+      }
+      continue;
+    }
+
+    if (state.tuningPhase === "prepareAcceptedFinalization") {
+      state.tuningAcceptedContext = {
+        edgeOptimization: state.tuningLastConvergence?.edgeOptimization ?? { improved: false, removedEdges: 0 },
+      };
+      startTuningConvergencePhase(state, "finalizing", "final", "knn", "cycleAcceptedSplit");
+      state.lastAction = `${state.lastAction}; running final ${solverName} cleanup`;
+      if (animateSolver) {
+        return;
+      }
+      continue;
+    }
+
+    if (state.tuningPhase === "completeNoSplit") {
+      const completion = state.tuningLastConvergence;
+      const settleLabel = completion?.settled ? "settled" : `hit the ${solverName} step cap`;
+      const completionLabel = completion?.settled
+        ? `final ${solverName} completed in ${completion.iterations} steps`
+        : `final ${solverName} hit the step cap after ${completion?.iterations ?? 0} steps`;
+      state.lastAction = `No improving hub split after ${settleLabel} at outer step ${state.outerIteration}; ${completionLabel}`;
+      state.tuningPhase = "done";
+      state.playing = false;
+      return;
+    }
+
+    if (state.tuningPhase === "cycleAcceptedSplit") {
+      const completion = state.tuningLastConvergence;
+      const baselineFinalObjective = state.tuningBaseline?.finalObjective ?? Infinity;
+      if (completion.metrics.objective + 1e-6 < baselineFinalObjective || state.forceStop) {
+        const edgeNote = state.tuningAcceptedContext?.edgeOptimization?.improved
+          ? `; pruned ${state.tuningAcceptedContext.edgeOptimization.removedEdges} edges after convergence`
+          : "";
+        const finalDelta = baselineFinalObjective - completion.metrics.objective;
+        const completionLabel = completion.settled
+          ? `final ${solverName} completed in ${completion.iterations} steps`
+          : `final ${solverName} hit the step cap after ${completion.iterations} steps`;
+        state.lastAction = `${state.lastAction}; ${completionLabel}; final ΔF=${finalDelta.toFixed(3)}${edgeNote}`;
+        state.tuningPhase = "cycleStart";
+        state.tuningPhaseData = null;
+        state.tuningBaseline = null;
+        state.tuningAcceptedContext = null;
+        return;
+      }
+
+      restoreTuningBaseline(state);
+      state.lastAction = `Rejected hub split at outer step ${state.outerIteration}; final ${solverName} objective rose from ${baselineFinalObjective.toFixed(3)} to ${completion.metrics.objective.toFixed(3)}`;
+      state.forceStop = true;
+      state.tuningPhase = "done";
+      state.tuningPhaseData = null;
+      state.tuningAcceptedContext = null;
+      state.playing = false;
+      return;
+    }
+
+    if (state.tuningPhase === "done") {
+      state.playing = false;
+      return;
+    }
   }
 }
 
