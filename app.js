@@ -16,6 +16,8 @@ const ui = {
   g2Value: document.getElementById("g2Value"),
   g3Value: document.getElementById("g3Value"),
   g4Value: document.getElementById("g4Value"),
+  primalMetricLabel: document.getElementById("primalMetricLabel"),
+  dualMetricLabel: document.getElementById("dualMetricLabel"),
   weightLabel: document.getElementById("weightLabel"),
   weightValue: document.getElementById("weightValue"),
   pathLabel: document.getElementById("pathLabel"),
@@ -25,6 +27,8 @@ const ui = {
   resetButton: document.getElementById("resetButton"),
   randomizeButton: document.getElementById("randomizeButton"),
   voronoiToggle: document.getElementById("voronoiToggle"),
+  optimizerAdmm: document.getElementById("optimizerAdmm"),
+  optimizerSgd: document.getElementById("optimizerSgd"),
   canvasSolverGroup: document.getElementById("canvasSolverGroup"),
   canvasExplorerMode: document.getElementById("canvasExplorerMode"),
   canvasTuningMode: document.getElementById("canvasTuningMode"),
@@ -52,12 +56,31 @@ const ui = {
 };
 
 const modeCopy = {
-  explorer:
-    'The browser runs a 2D, deterministic ADMM-style solver over hub locations <code>x, z₁, z₂, z₃, u₁, u₂, u₃</code>. Each frame updates point assignments, shortest-path regularisation, quadratic shrinkage, graph total variation, and a station-count penalty.',
-  tuning:
-    "This tab reuses the explorer's local kNN-graph ADMM solver at each fixed hub count. It starts from 3 KMeans hubs, settles the current geometry with the same ADMM updates as the explorer, then splits the highest-energy Voronoi cell and keeps the new hub only when that locally converged split lowers the loss after the station penalty is included.",
-  canvas:
-    "This tab turns the main canvas into a point-cloud editor. Each click adds an observed point, then the browser re-seeds hub locations from that clicked cloud and solves with the selected <code>app.js</code> path: the explorer's local kNN-graph ADMM update or the existing hub-tuning loop.",
+  explorer: {
+    admm:
+      'The browser runs a 2D, deterministic ADMM-style solver over hub locations <code>x, z₁, z₂, z₃, u₁, u₂, u₃</code>. Each frame updates point assignments, shortest-path regularisation, quadratic shrinkage, graph total variation, and a station-count penalty.',
+    sgd:
+      "The browser runs a 2D stochastic-gradient descent path over the same objective. Each step samples point and path terms, rebuilds the local kNN graph, and descends the combined fit, smoothness, shrinkage, graph variation, and station-cost energy.",
+  },
+  tuning: {
+    admm:
+      "This tab reuses the explorer's local kNN-graph ADMM solver at each fixed hub count. It starts from 3 KMeans hubs, settles the current geometry with the same ADMM updates as the explorer, then splits the highest-energy Voronoi cell and keeps the new hub only when that locally converged split lowers the loss after the station penalty is included.",
+    sgd:
+      "This tab reuses the explorer's local kNN-graph SGD solver at each fixed hub count. It starts from 3 KMeans hubs, settles the current geometry with the same SGD updates as the explorer, then splits the highest-energy Voronoi cell and keeps the new hub only when that locally converged split lowers the loss after the station penalty is included.",
+  },
+  canvas: {
+    admm:
+      "This tab turns the main canvas into a point-cloud editor. Each click adds an observed point, then the browser re-seeds hub locations from that clicked cloud and solves with the selected <code>app.js</code> path: the explorer's local kNN-graph ADMM update or the existing hub-tuning loop.",
+    sgd:
+      "This tab turns the main canvas into a point-cloud editor. Each click adds an observed point, then the browser re-seeds hub locations from that clicked cloud and solves with the selected <code>app.js</code> path: the explorer's local kNN-graph SGD update or the existing hub-tuning loop.",
+  },
+};
+
+const sgdDefaults = {
+  learningRate: 0.003,
+  decay: 0.04,
+  batchSize: 160,
+  pairSamples: 12,
 };
 
 function mulberry32(seed) {
@@ -608,7 +631,7 @@ function proxZ1(state, graph, weights) {
   const v = state.x.map((point, i) => add(point, state.u1[i]));
   const totalMass = Math.max(weights.reduce((sum, value) => sum + value, 0), 1);
 
-  for (let step = 0; step < 7; step += 1) {
+  for (let step = 0; step < 15; step += 1) {
     const grad = z.map(() => vec(0, 0));
 
     for (let i = 0; i < z.length; i += 1) {
@@ -643,7 +666,7 @@ function proxZ3(state, edges) {
   const z = clonePoints(state.z3);
   const v = state.x.map((point, i) => add(point, state.u3[i]));
 
-  for (let step = 0; step < 7; step += 1) {
+  for (let step = 0; step < 15; step += 1) {
     const grad = z.map(() => vec(0, 0));
     for (const [a, b] of edges) {
       const delta = sub(z[a], z[b]);
@@ -713,7 +736,6 @@ function evaluateObjective(hubs, edges, cloud, params) {
   const g3 = computeGraphVariation(hubs, graph.edges, params.mu);
   const g4 = computeStationBuildCost(hubs, params.stationCost);
 
-  console.log(g2, g3)
   return {
     objective: fx + g1Info.value + g2 + g3 + g4,
     fx,
@@ -729,11 +751,16 @@ function evaluateObjective(hubs, edges, cloud, params) {
   };
 }
 
+function optimizerLabel(method) {
+  return method === "sgd" ? "SGD" : "ADMM";
+}
+
 function syncStateParams(state) {
   state.rho = Number(ui.rho.value);
   state.lambda = Number(ui.lambda.value);
   state.mu = Number(ui.mu.value);
   state.stationCost = Number(ui.stationCost.value);
+  state.optimizer = optimizationMethod;
 }
 
 function resetAdmmVariables(state, x, edges) {
@@ -756,10 +783,16 @@ function createBaseState(mode, cloud, x, edges) {
     cloud,
     playing: true,
     iteration: 0,
+    optimizer: optimizationMethod,
     lambda: Number(ui.lambda.value),
     mu: Number(ui.mu.value),
     rho: Number(ui.rho.value),
     stationCost: Number(ui.stationCost.value),
+    sgdLearningRate: sgdDefaults.learningRate,
+    sgdDecay: sgdDefaults.decay,
+    sgdBatchSize: sgdDefaults.batchSize,
+    sgdPairSamples: sgdDefaults.pairSamples,
+    sgdRng: mulberry32(currentCloudSeed + x.length * 31 + mode.length * 17),
     history: [],
     lastAction: "Initialised",
     forceStop: false,
@@ -811,7 +844,7 @@ function createCanvasState(cloud = customCloud, solveMode = canvasSolveMode) {
   } else {
     const hubCount = Math.max(1, Math.min(Number(ui.hubCount.value), points.length));
     x = sampleInitialHubs(points, hubCount, 1337);
-    lastAction = `Seeded ${x.length} hubs from ${points.length} clicked points`;
+    lastAction = `Seeded ${x.length} hubs from ${points.length} clicked points for ${optimizerLabel(optimizationMethod)}`;
   }
 
   const state = createBaseState("canvas", points, x, edges);
@@ -884,7 +917,93 @@ function runAdmmIteration(state, graphMode = "knn", pushHistory = true, fixedEdg
   return { metrics, primal, dual };
 }
 
+function sampleWithoutReplacement(points, count, rng) {
+  if (count >= points.length) {
+    return points.slice();
+  }
+  const indices = new Set();
+  while (indices.size < count) {
+    indices.add(Math.floor(rng() * points.length));
+  }
+  return [...indices].map((index) => points[index]);
+}
+
+function computeSgdGradient(x, cloud, params, rng, edges = null) {
+  const grad = x.map(() => vec(0, 0));
+  const batch = sampleWithoutReplacement(cloud, Math.min(params.sgdBatchSize, cloud.length), rng);
+  const batchScale = cloud.length / Math.max(batch.length, 1);
+
+  for (const point of batch) {
+    const best = nearestCenterIndex(point, x);
+    grad[best] = add(grad[best], scale(sub(x[best], point), batchScale));
+  }
+
+  for (let i = 0; i < x.length; i += 1) {
+    grad[i] = add(grad[i], scale(x[i], 2 * params.lambda));
+  }
+
+  const graph = edges ? graphFromEdges(x, edges) : buildKnnGraph(x, 2);
+  for (const [a, b] of graph.edges) {
+    const unit = normalize(sub(x[a], x[b]));
+    grad[a] = add(grad[a], scale(unit, params.mu));
+    grad[b] = add(grad[b], scale(unit, -params.mu));
+  }
+
+  const { weights } = assignPoints(x, cloud);
+  const totalMass = Math.max(weights.reduce((sum, value) => sum + value, 0), 1);
+  const sampledPairs = Math.min(params.sgdPairSamples, (x.length * (x.length - 1)) / 2);
+  const pairNormaliser = ((x.length * (x.length - 1)) / 2) / Math.max(sampledPairs, 1);
+
+  for (let sample = 0; sample < sampledPairs; sample += 1) {
+    const i = Math.floor(rng() * x.length);
+    let j = Math.floor(rng() * (x.length - 1));
+    if (j >= i) {
+      j += 1;
+    }
+    const lo = Math.min(i, j);
+    const hi = Math.max(i, j);
+    const result = dijkstra(graph.adjacency, lo);
+    if (!Number.isFinite(result.dist[hi])) {
+      continue;
+    }
+    const coeff = pairNormaliser * 0.5 * (weights[lo] * weights[hi]) / (totalMass * totalMass);
+    const path = reconstructPath(result.prev, lo, hi);
+    for (let p = 0; p < path.length - 1; p += 1) {
+      const a = path[p];
+      const b = path[p + 1];
+      const unit = normalize(sub(x[a], x[b]));
+      grad[a] = add(grad[a], scale(unit, coeff));
+      grad[b] = add(grad[b], scale(unit, -coeff));
+    }
+  }
+
+  return { grad, graph };
+}
+
+function runSgdIteration(state, graphMode = "knn", pushHistory = true, fixedEdges = null) {
+  syncStateParams(state);
+  const previousX = clonePoints(state.x);
+  const previousObjective = state.history[state.history.length - 1]?.objective ?? null;
+  const graphEdges = fixedEdges !== null ? fixedEdges : graphMode === "fixed" ? state.edges : null;
+  const { grad } = computeSgdGradient(state.x, state.cloud, state, state.sgdRng, graphEdges);
+  const learningRate = state.sgdLearningRate / Math.sqrt(1 + state.iteration * state.sgdDecay);
+  state.x = state.x.map((point, index) => sub(point, scale(grad[index], learningRate)));
+  const graph = fixedEdges !== null ? graphFromEdges(state.x, fixedEdges) : graphMode === "fixed" ? graphFromEdges(state.x, state.edges) : buildKnnGraph(state.x, 2);
+  state.edges = graph.edges;
+  const metrics = evaluateObjective(state.x, state.edges, state.cloud, state);
+  const motion = computeMotionStats(state.x, previousX);
+  const objectiveDelta = previousObjective === null ? 0 : Math.abs(metrics.objective - previousObjective);
+  state.iteration += 1;
+  if (pushHistory) {
+    recordHistory(state, metrics, motion.total, objectiveDelta);
+  }
+  return { metrics, primal: motion.total, dual: objectiveDelta, motion };
+}
+
 function runFixedKConvergence(state, options = {}) {
+  if (state.optimizer === "sgd") {
+    return runFixedKSgdConvergence(state, options);
+  }
   const {
     maxIterations = 48,
     minIterations = 6,
@@ -908,6 +1027,38 @@ function runFixedKConvergence(state, options = {}) {
     const thresholds = computeResidualThresholds(state, primalAbsTolerance, primalRelTolerance);
     const residualSettled = latest.primal <= thresholds.primal && latest.dual <= thresholds.dual;
     if (iteration + 1 >= minIterations && residualSettled) {
+      return { ...latest, motion, settled: true, iterations: iteration + 1 };
+    }
+    if ((globalThis.performance?.now?.() ?? Date.now()) - startTime >= maxRuntimeMs) {
+      return { ...latest, motion, settled: false, iterations: iteration + 1, timedOut: true };
+    }
+  }
+
+  return { ...latest, motion, settled: false, iterations: maxIterations };
+}
+
+function runFixedKSgdConvergence(state, options = {}) {
+  const {
+    maxIterations = 96,
+    minIterations = 12,
+    pushHistory = true,
+    graphMode = "knn",
+    maxRuntimeMs = Infinity,
+    motionTolerance = 0.0005,
+    objectiveTolerance = 0.0005,
+  } = options;
+
+  let latest = null;
+  let motion = { total: Infinity, avg: Infinity, max: Infinity };
+  const fixedEdges = graphMode === "knn" ? buildKnnGraph(state.x, 2).edges : canonicalizeEdges(state.edges);
+  state.edges = fixedEdges;
+  const startTime = globalThis.performance?.now?.() ?? Date.now();
+
+  for (let iteration = 0; iteration < maxIterations; iteration += 1) {
+    latest = runSgdIteration(state, graphMode, pushHistory, fixedEdges);
+    motion = latest.motion;
+    const settled = motion.avg <= motionTolerance && latest.dual <= objectiveTolerance;
+    if (iteration + 1 >= minIterations && settled) {
       return { ...latest, motion, settled: true, iterations: iteration + 1 };
     }
     if ((globalThis.performance?.now?.() ?? Date.now()) - startTime >= maxRuntimeMs) {
@@ -978,10 +1129,10 @@ function optimizeEdgesForState(state, metrics = null) {
   return { edges: currentEdges, metrics: currentMetrics, removedEdges, improved };
 }
 
-function runConvergedAdmmWithEdgeOptimization(state, options = {}) {
+function runConvergedOptimizationWithEdgeOptimization(state, options = {}) {
   const convergenceOptions = {
-    maxIterations: 48,
-    minIterations: 6,
+    maxIterations: state.optimizer === "sgd" ? 96 : 48,
+    minIterations: state.optimizer === "sgd" ? 12 : 6,
     primalAbsTolerance: 0.0005,
     primalRelTolerance: 0.004,
     pushHistory: true,
@@ -1006,6 +1157,16 @@ function runConvergedAdmmWithEdgeOptimization(state, options = {}) {
 }
 
 function runFinalAdmmCompletion(state) {
+  if (state.optimizer === "sgd") {
+    return runFixedKConvergence(state, {
+      maxIterations: 160,
+      minIterations: 20,
+      graphMode: "knn",
+      maxRuntimeMs: 40,
+      motionTolerance: 0.00025,
+      objectiveTolerance: 0.00025,
+    });
+  }
   return runFixedKConvergence(state, {
     maxIterations: 96,
     minIterations: 12,
@@ -1022,7 +1183,7 @@ function simulateFixedHubRefinement(baseState, x, edges) {
   state.mu = baseState.mu;
   state.rho = baseState.rho;
   state.stationCost = baseState.stationCost;
-  const convergence = runConvergedAdmmWithEdgeOptimization(state, { pushHistory: false, graphMode: "knn" });
+  const convergence = runConvergedOptimizationWithEdgeOptimization(state, { pushHistory: false, graphMode: "knn" });
   return { state, metrics: convergence.metrics, convergence };
 }
 
@@ -1102,7 +1263,11 @@ function stepExplorerState(state) {
     state.playing = false;
     return;
   }
-  runAdmmIteration(state, "knn", true);
+  if (state.optimizer === "sgd") {
+    runSgdIteration(state, "knn", true);
+  } else {
+    runAdmmIteration(state, "knn", true);
+  }
 }
 
 function stepTuningState(state) {
@@ -1111,7 +1276,7 @@ function stepTuningState(state) {
     return;
   }
   syncStateParams(state);
-  let convergence = runConvergedAdmmWithEdgeOptimization(state, { graphMode: "knn" });
+  let convergence = runConvergedOptimizationWithEdgeOptimization(state, { graphMode: "knn" });
   const baselineX = clonePoints(state.x);
   const baselineEdges = canonicalizeEdges(state.edges);
   const baselineIteration = state.iteration;
@@ -1121,6 +1286,7 @@ function stepTuningState(state) {
   const baselineHistoryLength = state.history.length;
   const baselineFinal = simulateFinalAdmmCompletion(state, baselineX, baselineEdges);
   const baselineFinalObjective = baselineFinal.metrics.objective;
+  const solverName = optimizerLabel(state.optimizer);
 
   state.outerIteration += 1;
 
@@ -1131,7 +1297,7 @@ function stepTuningState(state) {
       splitProposal.simulation,
       `Added hub from Voronoi split ${splitProposal.clusterIndex} via ${splitProposal.anchorIndex} (ΔF=${splitProposal.delta.toFixed(3)})`,
     );
-    convergence = runConvergedAdmmWithEdgeOptimization(state, { graphMode: "knn" });
+    convergence = runConvergedOptimizationWithEdgeOptimization(state, { graphMode: "knn" });
     const finalConvergence = runFinalAdmmCompletion(state);
     if (finalConvergence.metrics.objective + 1e-6 < baselineFinalObjective || state.forceStop) {
       const finalDelta = baselineFinalObjective - finalConvergence.metrics.objective;
@@ -1139,11 +1305,11 @@ function stepTuningState(state) {
         ? `; pruned ${convergence.edgeOptimization.removedEdges} edges after convergence`
         : "";
       const completionLabel = finalConvergence.settled
-        ? `final ADMM completed in ${finalConvergence.iterations} sweeps`
+        ? `final ${solverName} completed in ${finalConvergence.iterations} steps`
         : finalConvergence.timedOut
-          ? `final ADMM stopped at the runtime budget after ${finalConvergence.iterations} sweeps`
-          : `final ADMM hit the sweep cap after ${finalConvergence.iterations} sweeps`;
-      state.lastAction = `${state.lastAction}; settled in ${convergence.iterations} ADMM sweeps; ${completionLabel}; final ΔF=${finalDelta.toFixed(3)}${edgeNote}`;
+          ? `final ${solverName} stopped at the runtime budget after ${finalConvergence.iterations} steps`
+          : `final ${solverName} hit the step cap after ${finalConvergence.iterations} steps`;
+      state.lastAction = `${state.lastAction}; settled in ${convergence.iterations} ${solverName} steps; ${completionLabel}; final ΔF=${finalDelta.toFixed(3)}${edgeNote}`;
     } else {
       resetAdmmVariables(state, baselineX, baselineEdges);
       state.iteration = baselineIteration;
@@ -1151,17 +1317,17 @@ function stepTuningState(state) {
       state.highlightedPath = baselineHighlightedPath;
       state.highlightedPair = baselineHighlightedPair;
       state.history.length = baselineHistoryLength;
-      state.lastAction = `Rejected hub split at outer step ${state.outerIteration}; final ADMM objective rose from ${baselineFinalObjective.toFixed(3)} to ${finalConvergence.metrics.objective.toFixed(3)}`;
-      state.forceStop = true
+      state.lastAction = `Rejected hub split at outer step ${state.outerIteration}; final ${solverName} objective rose from ${baselineFinalObjective.toFixed(3)} to ${finalConvergence.metrics.objective.toFixed(3)}`;
+      state.forceStop = true;
     }
   } else {
-    const settleLabel = convergence.settled ? "settled" : "hit the ADMM sweep cap";
+    const settleLabel = convergence.settled ? "settled" : `hit the ${solverName} step cap`;
     const finalConvergence = runFinalAdmmCompletion(state);
     const completionLabel = finalConvergence.settled
-      ? `final ADMM completed in ${finalConvergence.iterations} sweeps`
+      ? `final ${solverName} completed in ${finalConvergence.iterations} steps`
       : finalConvergence.timedOut
-        ? `final ADMM stopped at the runtime budget after ${finalConvergence.iterations} sweeps`
-        : `final ADMM hit the sweep cap after ${finalConvergence.iterations} sweeps`;
+        ? `final ${solverName} stopped at the runtime budget after ${finalConvergence.iterations} steps`
+        : `final ${solverName} hit the step cap after ${finalConvergence.iterations} steps`;
     state.lastAction = `No improving hub split after ${settleLabel} at outer step ${state.outerIteration}; ${completionLabel}`;
     state.playing = false;
   }
@@ -1424,6 +1590,7 @@ let activeMode = "explorer";
 let currentCloudSeed = 12;
 let customCloud = [];
 let canvasSolveMode = "explorer";
+let optimizationMethod = "admm";
 let showVoronoiOverlay = false;
 let explorerState = createExplorerState();
 let tuningState = createTuningState();
@@ -1466,12 +1633,18 @@ function updateUi() {
   ui.g3Value.textContent = current.g3.toFixed(3);
   ui.g4Value.textContent = current.g4.toFixed(3);
   ui.playPause.textContent = state.playing ? "Pause" : "Play";
+  ui.primalMetricLabel.textContent = state.optimizer === "sgd" ? "Hub motion" : "Primal residual";
+  ui.dualMetricLabel.textContent = state.optimizer === "sgd" ? "Objective delta" : "Dual residual";
   syncSliderLabels();
-  ui.modeSummary.innerHTML = modeCopy[activeMode];
+  ui.modeSummary.innerHTML = modeCopy[activeMode][optimizationMethod];
+  ui.explorerTab.textContent = `${optimizerLabel(optimizationMethod)} Explorer`;
   ui.explorerTab.classList.toggle("is-active", activeMode === "explorer");
   ui.tuningTab.classList.toggle("is-active", activeMode === "tuning");
   ui.canvasTab.classList.toggle("is-active", activeMode === "canvas");
+  ui.optimizerAdmm.classList.toggle("is-active", optimizationMethod === "admm");
+  ui.optimizerSgd.classList.toggle("is-active", optimizationMethod === "sgd");
   ui.canvasSolverGroup.classList.toggle("is-hidden", activeMode !== "canvas");
+  ui.canvasExplorerMode.textContent = `${optimizerLabel(optimizationMethod)} Explorer`;
   ui.canvasExplorerMode.classList.toggle("is-active", canvasSolveMode === "explorer");
   ui.canvasTuningMode.classList.toggle("is-active", canvasSolveMode === "tuning");
   ui.hubCountGroup.classList.toggle(
@@ -1513,7 +1686,7 @@ function updateUi() {
     residualCanvas,
     [state.history.map((row) => row.primal), state.history.map((row) => row.dual)],
     ["#d77b2a", "#3f5d53"],
-    ["primal", "dual"],
+    state.optimizer === "sgd" ? ["motion", "delta"] : ["primal", "dual"],
   );
 }
 
@@ -1560,6 +1733,17 @@ function switchMode(mode) {
     return;
   }
   updateUi();
+}
+
+function setOptimizationMethod(method) {
+  if (optimizationMethod === method) {
+    return;
+  }
+  optimizationMethod = method;
+  explorerState = createExplorerState();
+  tuningState = createTuningState();
+  canvasState = createCanvasState();
+  resetState(activeMode);
 }
 
 function nudgeCamera(dx = 0, dy = 0) {
@@ -1650,6 +1834,8 @@ ui.voronoiToggle.addEventListener("click", () => {
   showVoronoiOverlay = !showVoronoiOverlay;
   updateUi();
 });
+ui.optimizerAdmm.addEventListener("click", () => setOptimizationMethod("admm"));
+ui.optimizerSgd.addEventListener("click", () => setOptimizationMethod("sgd"));
 ui.explorerTab.addEventListener("click", () => switchMode("explorer"));
 ui.tuningTab.addEventListener("click", () => switchMode("tuning"));
 ui.canvasTab.addEventListener("click", () => switchMode("canvas"));
@@ -1686,7 +1872,7 @@ sceneCanvas.addEventListener("click", (event) => {
   canvasState.lastAction =
     canvasSolveMode === "tuning"
       ? `Added point ${customCloud.length}; hub tuning restarted with ${canvasState.x.length} hubs`
-      : `Added point ${customCloud.length}; solving with ${canvasState.x.length} hubs`;
+      : `Added point ${customCloud.length}; solving with ${canvasState.x.length} hubs via ${optimizerLabel(optimizationMethod)}`;
   updateUi();
 });
 

@@ -83,6 +83,13 @@
               <button id="randomizeButton" class="ghost">Randomise</button>
               <button id="voronoiToggle" class="ghost" type="button">Show Voronoi</button>
             </div>
+            <div class="solver-toggle">
+              <span class="solver-toggle-label">Optimization method</span>
+              <div class="solver-toggle-buttons" role="group" aria-label="Optimization method">
+                <button id="optimizerAdmm" class="solver-mode is-active" type="button">ADMM</button>
+                <button id="optimizerSgd" class="solver-mode" type="button">SGD</button>
+              </div>
+            </div>
             <div id="canvasSolverGroup" class="solver-toggle is-hidden">
               <span class="solver-toggle-label">Canvas solver</span>
               <div class="solver-toggle-buttons" role="group" aria-label="Canvas solver mode">
@@ -122,11 +129,11 @@
               <strong id="objectiveValue">0.000</strong>
             </article>
             <article class="metric-card">
-              <span class="metric-label">Primal residual</span>
+              <span id="primalMetricLabel" class="metric-label">Primal residual</span>
               <strong id="primalValue">0.000</strong>
             </article>
             <article class="metric-card">
-              <span class="metric-label">Dual residual</span>
+              <span id="dualMetricLabel" class="metric-label">Dual residual</span>
               <strong id="dualValue">0.000</strong>
             </article>
           </div>
