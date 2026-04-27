@@ -305,6 +305,20 @@ code {
   color: #fff8ef;
 }
 
+.toggle-check {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  margin-bottom: 14px;
+  color: var(--muted);
+  font-size: 0.92rem;
+}
+
+.toggle-check input {
+  margin: 0;
+  accent-color: var(--accent);
+}
+
 .is-hidden {
   display: none !important;
 }

@@ -32,6 +32,8 @@ const ui = {
   canvasSolverGroup: document.getElementById("canvasSolverGroup"),
   canvasExplorerMode: document.getElementById("canvasExplorerMode"),
   canvasTuningMode: document.getElementById("canvasTuningMode"),
+  skipAdmmTuningAnimationGroup: document.getElementById("skipAdmmTuningAnimationGroup"),
+  skipAdmmTuningAnimation: document.getElementById("skipAdmmTuningAnimation"),
   hubCountGroup: document.getElementById("hubCountGroup"),
   hubCount: document.getElementById("hubCount"),
   hubCountValue: document.getElementById("hubCountValue"),
@@ -1458,7 +1460,7 @@ function stepTuningState(state) {
   }
   syncStateParams(state);
   const solverName = optimizerLabel(state.optimizer);
-  const animateSolver = state.optimizer === "admm";
+  const animateSolver = shouldAnimateAdmmTuning(state);
 
   if (!state.tuningPhase) {
     initializeTuningLoopState(state, `Start tuning with ${state.x.length} hubs`);
@@ -1836,6 +1838,7 @@ let customCloud = [];
 let canvasSolveMode = "explorer";
 let optimizationMethod = "admm";
 let showVoronoiOverlay = false;
+let skipAdmmTuningAnimation = false;
 let explorerState = createExplorerState();
 let tuningState = createTuningState();
 let canvasState = createCanvasState();
@@ -1848,6 +1851,10 @@ function getActiveState() {
     return tuningState;
   }
   return canvasState;
+}
+
+function shouldAnimateAdmmTuning(state) {
+  return state.optimizer === "admm" && !skipAdmmTuningAnimation;
 }
 
 function updateUi() {
@@ -1891,6 +1898,11 @@ function updateUi() {
   ui.canvasExplorerMode.textContent = `${optimizerLabel(optimizationMethod)} Explorer`;
   ui.canvasExplorerMode.classList.toggle("is-active", canvasSolveMode === "explorer");
   ui.canvasTuningMode.classList.toggle("is-active", canvasSolveMode === "tuning");
+  ui.skipAdmmTuningAnimation.checked = skipAdmmTuningAnimation;
+  ui.skipAdmmTuningAnimationGroup.classList.toggle(
+    "is-hidden",
+    optimizationMethod !== "admm" || (activeMode !== "tuning" && !(activeMode === "canvas" && canvasSolveMode === "tuning")),
+  );
   ui.hubCountGroup.classList.toggle(
     "is-hidden",
     activeMode === "tuning" || (activeMode === "canvas" && canvasSolveMode === "tuning"),
@@ -2092,6 +2104,10 @@ ui.canvasTuningMode.addEventListener("click", () => {
   canvasSolveMode = "tuning";
   canvasState = createCanvasState();
   resetState(activeMode);
+});
+ui.skipAdmmTuningAnimation.addEventListener("change", () => {
+  skipAdmmTuningAnimation = ui.skipAdmmTuningAnimation.checked;
+  updateUi();
 });
 ui.zoomIn.addEventListener("click", () => changeZoom(1.2));
 ui.zoomOut.addEventListener("click", () => changeZoom(1 / 1.2));
