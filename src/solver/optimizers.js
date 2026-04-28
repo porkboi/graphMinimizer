@@ -1,0 +1,493 @@
+import { buildKnnGraph, buildCompleteGraph, canonicalizeEdges, dijkstra, graphFromEdges, isGraphConnected, reconstructPath } from "../core/graph.js";
+import { assignPoints, computeClusterEnergies, evaluateObjective } from "../core/objective.js";
+import { add, clonePoints, dist, norm, normalize, scale, sub, vec } from "../core/math.js";
+
+function proxX(state) {
+  const vPoints = state.x.map((_, i) =>
+    scale(
+      add(add(sub(state.z1[i], state.u1[i]), sub(state.z2[i], state.u2[i])), sub(state.z3[i], state.u3[i])),
+      1 / 3,
+    ),
+  );
+  const { assignments } = assignPoints(vPoints, state.cloud);
+  const nextX = [];
+  for (let i = 0; i < vPoints.length; i += 1) {
+    const bucket = assignments[i];
+    let sum = vec(0, 0);
+    for (const point of bucket) {
+      sum = add(sum, point);
+    }
+    const consensus = add(add(sub(state.z1[i], state.u1[i]), sub(state.z2[i], state.u2[i])), sub(state.z3[i], state.u3[i]));
+    const denom = bucket.length + 3 * state.rho;
+    const eta = state.admmEta / Math.sqrt(1 + state.iteration * state.admmDecay);
+    nextX.push(scale(add(sum, scale(consensus, eta)), 1 / Math.max(denom, 1e-6)));
+  }
+  return nextX;
+}
+
+function proxZ2(state) {
+  const factor = state.rho / (state.rho + 2 * state.lambda);
+  return state.x.map((point, i) => scale(add(point, state.u2[i]), factor));
+}
+
+function proxZ1(state, graph, weights) {
+  const z = clonePoints(state.z1);
+  const v = state.x.map((point, i) => add(point, state.u1[i]));
+  const totalMass = Math.max(weights.reduce((sum, value) => sum + value, 0), 1);
+
+  for (let step = 0; step < 15; step += 1) {
+    const grad = z.map(() => vec(0, 0));
+
+    for (let i = 0; i < z.length; i += 1) {
+      const result = dijkstra(graph.adjacency, i);
+      for (let j = i + 1; j < z.length; j += 1) {
+        if (!Number.isFinite(result.dist[j])) {
+          continue;
+        }
+        const coeff = 0.5 * (weights[i] * weights[j]) / (totalMass * totalMass);
+        const path = reconstructPath(result.prev, i, j);
+        for (let p = 0; p < path.length - 1; p += 1) {
+          const a = path[p];
+          const b = path[p + 1];
+          const delta = sub(z[a], z[b]);
+          const unit = normalize(delta);
+          const eta = state.admmEta / Math.sqrt(1 + state.iteration * state.admmDecay);
+          grad[a] = add(grad[a], scale(unit, eta * coeff));
+          grad[b] = add(grad[b], scale(unit, -eta * coeff));
+        }
+      }
+    }
+
+    for (let i = 0; i < z.length; i += 1) {
+      const proxGrad = add(grad[i], scale(sub(z[i], v[i]), state.rho));
+      z[i] = sub(z[i], scale(proxGrad, 0.12));
+    }
+  }
+
+  return z;
+}
+
+function proxZ3(state, edges) {
+  const z = clonePoints(state.z3);
+  const v = state.x.map((point, i) => add(point, state.u3[i]));
+
+  for (let step = 0; step < 15; step += 1) {
+    const grad = z.map(() => vec(0, 0));
+    for (const [a, b] of edges) {
+      const delta = sub(z[a], z[b]);
+      const unit = normalize(delta);
+      const eta = state.admmEta / Math.sqrt(1 + state.iteration * state.admmDecay);
+      grad[a] = add(grad[a], scale(unit, eta));
+      grad[b] = add(grad[b], scale(unit, -eta));
+    }
+    for (let i = 0; i < z.length; i += 1) {
+      const proxGrad = add(grad[i], scale(sub(z[i], v[i]), state.rho));
+      z[i] = sub(z[i], scale(proxGrad, 0.11));
+    }
+  }
+
+  return z;
+}
+
+function residualSum(a, b) {
+  let total = 0;
+  for (let i = 0; i < a.length; i += 1) {
+    total += dist(a[i], b[i]);
+  }
+  return total;
+}
+
+function pointSetNormSum(points) {
+  let total = 0;
+  for (const point of points) {
+    total += norm(point);
+  }
+  return total;
+}
+
+function computeResidualThresholds(state, absTolerance = 0.0005, relTolerance = 0.004) {
+  const variableCount = state.x.length * 3;
+  const xNorm = pointSetNormSum(state.x);
+  const zNorm = pointSetNormSum(state.z1) + pointSetNormSum(state.z2) + pointSetNormSum(state.z3);
+  const uNorm = pointSetNormSum(state.u1) + pointSetNormSum(state.u2) + pointSetNormSum(state.u3);
+  return {
+    primal: absTolerance * variableCount + relTolerance * Math.max(xNorm, zNorm),
+    dual: absTolerance * variableCount + relTolerance * state.rho * uNorm,
+  };
+}
+
+function computeMotionStats(current, previous) {
+  let total = 0;
+  let max = 0;
+  for (let i = 0; i < current.length; i += 1) {
+    const motion = dist(current[i], previous[i]);
+    total += motion;
+    if (motion > max) {
+      max = motion;
+    }
+  }
+  return {
+    total,
+    avg: current.length ? total / current.length : 0,
+    max,
+  };
+}
+
+function recordHistory(state, metrics, primal, dual) {
+  state.weights = metrics.weights;
+  state.highlightedPath = metrics.highlightedPath;
+  state.highlightedPair = metrics.highlightedPair;
+  state.history.push({
+    objective: metrics.objective,
+    primal,
+    dual,
+    fx: metrics.fx,
+    g1: metrics.g1,
+    g2: metrics.g2,
+    g3: metrics.g3,
+    g4: metrics.g4,
+    maxWeight: Math.max(...metrics.weights, 0),
+    hubCount: state.x.length,
+    edgeCount: state.edges.length,
+  });
+  if (state.history.length > 180) {
+    state.history.shift();
+  }
+}
+
+function runAdmmIteration(state, graphMode = "knn", pushHistory = true, fixedEdges = null) {
+  const previousZ1 = clonePoints(state.z1);
+  const previousZ2 = clonePoints(state.z2);
+  const previousZ3 = clonePoints(state.z3);
+  const assignmentBefore = assignPoints(state.x, state.cloud);
+  state.weights = assignmentBefore.weights;
+
+  state.x = proxX(state);
+
+  const graph =
+    fixedEdges !== null
+      ? graphFromEdges(state.x, fixedEdges)
+      : graphMode === "fixed"
+        ? graphFromEdges(state.x, state.edges)
+        : buildKnnGraph(state.x, 2);
+  state.edges = graph.edges;
+  state.z1 = proxZ1(state, graph, assignmentBefore.weights);
+  state.z2 = proxZ2(state);
+  state.z3 = proxZ3(state, graph.edges);
+
+  for (let i = 0; i < state.x.length; i += 1) {
+    state.u1[i] = add(state.u1[i], sub(state.x[i], state.z1[i]));
+    state.u2[i] = add(state.u2[i], sub(state.x[i], state.z2[i]));
+    state.u3[i] = add(state.u3[i], sub(state.x[i], state.z3[i]));
+  }
+
+  const metrics = evaluateObjective(state.x, state.edges, state.cloud, state);
+  const primal = residualSum(state.x, state.z1) + residualSum(state.x, state.z2) + residualSum(state.x, state.z3);
+  const dual =
+    state.rho * residualSum(state.z1, previousZ1) +
+    state.rho * residualSum(state.z2, previousZ2) +
+    state.rho * residualSum(state.z3, previousZ3);
+
+  state.iteration += 1;
+  if (pushHistory) {
+    recordHistory(state, metrics, primal, dual);
+  }
+  return { metrics, primal, dual };
+}
+
+function sampleWithoutReplacement(points, count, rng) {
+  if (count >= points.length) {
+    return points.slice();
+  }
+  const indices = new Set();
+  while (indices.size < count) {
+    indices.add(Math.floor(rng() * points.length));
+  }
+  return [...indices].map((index) => points[index]);
+}
+
+function computeSgdGradient(x, cloud, params, rng, edges = null) {
+  const grad = x.map(() => vec(0, 0));
+  const batch = sampleWithoutReplacement(cloud, Math.min(params.sgdBatchSize, cloud.length), rng);
+  const batchScale = cloud.length / Math.max(batch.length, 1);
+
+  for (const point of batch) {
+    const best = computeNearestCenterIndex(point, x);
+    grad[best] = add(grad[best], scale(sub(x[best], point), batchScale));
+  }
+
+  for (let i = 0; i < x.length; i += 1) {
+    grad[i] = add(grad[i], scale(x[i], 2 * params.lambda));
+  }
+
+  const graph = edges ? graphFromEdges(x, edges) : buildKnnGraph(x, 2);
+  for (const [a, b] of graph.edges) {
+    const unit = normalize(sub(x[a], x[b]));
+    grad[a] = add(grad[a], scale(unit, params.mu));
+    grad[b] = add(grad[b], scale(unit, -params.mu));
+  }
+
+  const { weights } = assignPoints(x, cloud);
+  const totalMass = Math.max(weights.reduce((sum, value) => sum + value, 0), 1);
+  const sampledPairs = Math.min(params.sgdPairSamples, (x.length * (x.length - 1)) / 2);
+  const pairNormaliser = ((x.length * (x.length - 1)) / 2) / Math.max(sampledPairs, 1);
+
+  for (let sample = 0; sample < sampledPairs; sample += 1) {
+    const i = Math.floor(rng() * x.length);
+    let j = Math.floor(rng() * (x.length - 1));
+    if (j >= i) {
+      j += 1;
+    }
+    const lo = Math.min(i, j);
+    const hi = Math.max(i, j);
+    const result = dijkstra(graph.adjacency, lo);
+    if (!Number.isFinite(result.dist[hi])) {
+      continue;
+    }
+    const coeff = pairNormaliser * 0.5 * (weights[lo] * weights[hi]) / (totalMass * totalMass);
+    const path = reconstructPath(result.prev, lo, hi);
+    for (let p = 0; p < path.length - 1; p += 1) {
+      const a = path[p];
+      const b = path[p + 1];
+      const unit = normalize(sub(x[a], x[b]));
+      grad[a] = add(grad[a], scale(unit, coeff));
+      grad[b] = add(grad[b], scale(unit, -coeff));
+    }
+  }
+
+  return { grad, graph };
+}
+
+function computeNearestCenterIndex(point, centers) {
+  let best = 0;
+  let bestDist = Infinity;
+  for (let i = 0; i < centers.length; i += 1) {
+    const dx = point.x - centers[i].x;
+    const dy = point.y - centers[i].y;
+    const d2 = dx * dx + dy * dy;
+    if (d2 < bestDist) {
+      bestDist = d2;
+      best = i;
+    }
+  }
+  return best;
+}
+
+function runSgdIteration(state, graphMode = "knn", pushHistory = true, fixedEdges = null) {
+  const previousX = clonePoints(state.x);
+  const previousObjective = state.history[state.history.length - 1]?.objective ?? null;
+  const graphEdges = fixedEdges !== null ? fixedEdges : graphMode === "fixed" ? state.edges : null;
+  const { grad } = computeSgdGradient(state.x, state.cloud, state, state.sgdRng, graphEdges);
+  const learningRate = state.sgdLearningRate / Math.sqrt(1 + state.iteration * state.sgdDecay);
+  state.x = state.x.map((point, index) => sub(point, scale(grad[index], learningRate)));
+  const graph =
+    fixedEdges !== null
+      ? graphFromEdges(state.x, fixedEdges)
+      : graphMode === "fixed"
+        ? graphFromEdges(state.x, state.edges)
+        : buildKnnGraph(state.x, 2);
+  state.edges = graph.edges;
+  const metrics = evaluateObjective(state.x, state.edges, state.cloud, state);
+  const motion = computeMotionStats(state.x, previousX);
+  const objectiveDelta = previousObjective === null ? 0 : Math.abs(metrics.objective - previousObjective);
+  state.iteration += 1;
+  if (pushHistory) {
+    recordHistory(state, metrics, motion.total, objectiveDelta);
+  }
+  return { metrics, primal: motion.total, dual: objectiveDelta, motion };
+}
+
+function runFixedKSgdConvergence(state, options = {}) {
+  const {
+    maxIterations = 96,
+    minIterations = 12,
+    pushHistory = true,
+    graphMode = "knn",
+    maxRuntimeMs = Infinity,
+    motionTolerance = 0.0005,
+    objectiveTolerance = 0.0005,
+  } = options;
+
+  let latest = null;
+  let motion = { total: Infinity, avg: Infinity, max: Infinity };
+  const fixedEdges = graphMode === "knn" ? buildKnnGraph(state.x, 2).edges : canonicalizeEdges(state.edges);
+  state.edges = fixedEdges;
+  const startTime = globalThis.performance?.now?.() ?? Date.now();
+
+  for (let iteration = 0; iteration < maxIterations; iteration += 1) {
+    latest = runSgdIteration(state, graphMode, pushHistory, fixedEdges);
+    motion = latest.motion;
+    const settled = motion.avg <= motionTolerance && latest.dual <= objectiveTolerance;
+    if (iteration + 1 >= minIterations && settled) {
+      return { ...latest, motion, settled: true, iterations: iteration + 1 };
+    }
+    if ((globalThis.performance?.now?.() ?? Date.now()) - startTime >= maxRuntimeMs) {
+      return { ...latest, motion, settled: false, iterations: iteration + 1, timedOut: true };
+    }
+  }
+
+  return { ...latest, motion, settled: false, iterations: maxIterations };
+}
+
+function runFixedKConvergence(state, options = {}) {
+  if (state.optimizer === "sgd") {
+    return runFixedKSgdConvergence(state, options);
+  }
+  const {
+    maxIterations = 48,
+    minIterations = 6,
+    primalAbsTolerance = 0.0005,
+    primalRelTolerance = 0.004,
+    pushHistory = true,
+    graphMode = "knn",
+    maxRuntimeMs = Infinity,
+  } = options;
+
+  let latest = null;
+  let motion = { total: Infinity, avg: Infinity, max: Infinity };
+  const fixedEdges = graphMode === "knn" ? buildKnnGraph(state.x, 2).edges : canonicalizeEdges(state.edges);
+  state.edges = fixedEdges;
+  const startTime = globalThis.performance?.now?.() ?? Date.now();
+
+  for (let iteration = 0; iteration < maxIterations; iteration += 1) {
+    const previousX = clonePoints(state.x);
+    latest = runAdmmIteration(state, graphMode, pushHistory, fixedEdges);
+    motion = computeMotionStats(state.x, previousX);
+    const thresholds = computeResidualThresholds(state, primalAbsTolerance, primalRelTolerance);
+    const residualSettled = latest.primal <= thresholds.primal && latest.dual <= thresholds.dual;
+    if (iteration + 1 >= minIterations && residualSettled) {
+      return { ...latest, motion, settled: true, iterations: iteration + 1 };
+    }
+    if ((globalThis.performance?.now?.() ?? Date.now()) - startTime >= maxRuntimeMs) {
+      return { ...latest, motion, settled: false, iterations: iteration + 1, timedOut: true };
+    }
+  }
+
+  return { ...latest, motion, settled: false, iterations: maxIterations };
+}
+
+function optimizeEdgesForState(state, metrics = null) {
+  if (state.x.length <= 1) {
+    state.edges = [];
+    const finalMetrics = metrics ?? evaluateObjective(state.x, state.edges, state.cloud, state);
+    return { edges: [], metrics: finalMetrics, removedEdges: 0, improved: false };
+  }
+
+  let currentEdges = canonicalizeEdges(state.edges);
+  let canReuseMetrics = Boolean(metrics) && currentEdges.length === state.edges.length;
+  if (!isGraphConnected(state.x, currentEdges)) {
+    currentEdges = buildCompleteGraph(state.x).edges;
+    canReuseMetrics = false;
+  }
+
+  let currentMetrics = canReuseMetrics ? metrics : evaluateObjective(state.x, currentEdges, state.cloud, state);
+  let improved = false;
+  let removedEdges = 0;
+  const startTime = globalThis.performance?.now?.() ?? Date.now();
+  const maxRuntimeMs = 24;
+
+  while (currentEdges.length > state.x.length - 1) {
+    if ((globalThis.performance?.now?.() ?? Date.now()) - startTime >= maxRuntimeMs) {
+      break;
+    }
+    let bestCandidate = null;
+
+    for (let edgeIndex = 0; edgeIndex < currentEdges.length; edgeIndex += 1) {
+      if ((globalThis.performance?.now?.() ?? Date.now()) - startTime >= maxRuntimeMs) {
+        break;
+      }
+      const candidateEdges = currentEdges.filter((_, index) => index !== edgeIndex);
+      if (!isGraphConnected(state.x, candidateEdges)) {
+        continue;
+      }
+
+      const candidateMetrics = evaluateObjective(state.x, candidateEdges, state.cloud, state);
+      const delta = currentMetrics.objective - candidateMetrics.objective;
+      if (delta > 1e-6 && (!bestCandidate || delta > bestCandidate.delta)) {
+        bestCandidate = {
+          edges: candidateEdges,
+          metrics: candidateMetrics,
+          delta,
+        };
+      }
+    }
+
+    if (!bestCandidate) {
+      break;
+    }
+
+    currentEdges = bestCandidate.edges;
+    currentMetrics = bestCandidate.metrics;
+    improved = true;
+    removedEdges += 1;
+  }
+
+  state.edges = currentEdges;
+  return { edges: currentEdges, metrics: currentMetrics, removedEdges, improved };
+}
+
+function runConvergedOptimizationWithEdgeOptimization(state, resetAdmmVariables, options = {}) {
+  const convergenceOptions = {
+    maxIterations: state.optimizer === "sgd" ? 96 : 48,
+    minIterations: state.optimizer === "sgd" ? 12 : 6,
+    primalAbsTolerance: 0.0005,
+    primalRelTolerance: 0.004,
+    pushHistory: true,
+    graphMode: "knn",
+    maxRuntimeMs: Infinity,
+    ...options,
+  };
+
+  const convergence = runFixedKConvergence(state, convergenceOptions);
+  const edgeOptimization = optimizeEdgesForState(state, convergence.metrics);
+
+  if (!edgeOptimization.improved) {
+    return { ...convergence, edgeOptimization };
+  }
+
+  resetAdmmVariables(state, state.x, edgeOptimization.edges);
+  const settled = runFixedKConvergence(state, {
+    ...convergenceOptions,
+    graphMode: "fixed",
+  });
+  return { ...settled, edgeOptimization };
+}
+
+function runFinalAdmmCompletion(state) {
+  if (state.optimizer === "sgd") {
+    return runFixedKConvergence(state, {
+      maxIterations: 160,
+      minIterations: 20,
+      graphMode: "knn",
+      maxRuntimeMs: 40,
+      motionTolerance: 0.00025,
+      objectiveTolerance: 0.00025,
+    });
+  }
+  return runFixedKConvergence(state, {
+    maxIterations: 96,
+    minIterations: 12,
+    primalAbsTolerance: 0.00025,
+    primalRelTolerance: 0.002,
+    graphMode: "knn",
+    maxRuntimeMs: 40,
+  });
+}
+
+export {
+  buildCompleteGraph,
+  buildKnnGraph,
+  canonicalizeEdges,
+  computeClusterEnergies,
+  computeMotionStats,
+  computeResidualThresholds,
+  evaluateObjective,
+  optimizeEdgesForState,
+  proxX,
+  recordHistory,
+  runAdmmIteration,
+  runConvergedOptimizationWithEdgeOptimization,
+  runFinalAdmmCompletion,
+  runFixedKConvergence,
+  runSgdIteration,
+};
