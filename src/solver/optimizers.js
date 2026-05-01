@@ -99,14 +99,14 @@ function buildPathEdgeWeights(graph, weights) {
   });
 }
 
-function proxX(state) {
+function proxX(state, assignmentsOverride = null) {
   const vPoints = state.x.map((_, i) =>
     scale(
       add(add(sub(state.z1[i], state.u1[i]), sub(state.z2[i], state.u2[i])), sub(state.z3[i], state.u3[i])),
       1 / 3,
     ),
   );
-  const { assignments } = assignPoints(vPoints, state.cloud);
+  const assignments = assignmentsOverride ?? assignPoints(vPoints, state.cloud).assignments;
   const nextX = [];
   for (let i = 0; i < vPoints.length; i += 1) {
     const bucket = assignments[i];
@@ -239,6 +239,47 @@ function runAdmmIteration(state, graphMode = "knn", pushHistory = true, fixedEdg
     recordHistory(state, metrics, primal, dual);
   }
   return { metrics, primal, dual };
+}
+
+function runFixedStructureAdmmBlock(state, innerIterations = 4, pushHistory = true) {
+  const blockAssignments = assignPoints(state.x, state.cloud);
+  const fixedGraph = buildKnnGraph(state.x, 2);
+  state.weights = blockAssignments.weights;
+  state.edges = fixedGraph.edges;
+
+  let latest = null;
+  for (let iteration = 0; iteration < innerIterations; iteration += 1) {
+    const previousZ1 = clonePoints(state.z1);
+    const previousZ2 = clonePoints(state.z2);
+    const previousZ3 = clonePoints(state.z3);
+
+    state.x = proxX(state, blockAssignments.assignments);
+    state.edges = fixedGraph.edges;
+    state.z1 = proxZ1(state, fixedGraph, blockAssignments.weights);
+    state.z2 = proxZ2(state);
+    state.z3 = proxZ3(state, fixedGraph.edges);
+
+    for (let i = 0; i < state.x.length; i += 1) {
+      state.u1[i] = add(state.u1[i], sub(state.x[i], state.z1[i]));
+      state.u2[i] = add(state.u2[i], sub(state.x[i], state.z2[i]));
+      state.u3[i] = add(state.u3[i], sub(state.x[i], state.z3[i]));
+    }
+
+    const metrics = evaluateObjective(state.x, state.edges, state.cloud, state);
+    const primal = residualSum(state.x, state.z1) + residualSum(state.x, state.z2) + residualSum(state.x, state.z3);
+    const dual =
+      state.rho * residualSum(state.z1, previousZ1) +
+      state.rho * residualSum(state.z2, previousZ2) +
+      state.rho * residualSum(state.z3, previousZ3);
+
+    state.iteration += 1;
+    latest = { metrics, primal, dual };
+  }
+
+  if (pushHistory && latest) {
+    recordHistory(state, latest.metrics, latest.primal, latest.dual);
+  }
+  return latest;
 }
 
 function sampleWithoutReplacement(points, count, rng) {
@@ -535,5 +576,6 @@ export {
   runConvergedOptimizationWithEdgeOptimization,
   runFinalAdmmCompletion,
   runFixedKConvergence,
+  runFixedStructureAdmmBlock,
   runSgdIteration,
 };

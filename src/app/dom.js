@@ -49,6 +49,9 @@ const ui = {
   muValue: document.getElementById("muValue"),
   stationCost: document.getElementById("stationCost"),
   stationCostValue: document.getElementById("stationCostValue"),
+  splitTopKGroup: document.getElementById("splitTopKGroup"),
+  splitTopK: document.getElementById("splitTopK"),
+  splitTopKValue: document.getElementById("splitTopKValue"),
   explorerTab: document.getElementById("explorerTab"),
   tuningTab: document.getElementById("tuningTab"),
   canvasTab: document.getElementById("canvasTab"),
@@ -88,6 +91,7 @@ const sliderConfigs = [
   { input: ui.lambda, value: ui.lambdaValue, format: (raw) => Number(raw).toFixed(2) },
   { input: ui.mu, value: ui.muValue, format: (raw) => Number(raw).toFixed(2) },
   { input: ui.stationCost, value: ui.stationCostValue, format: (raw) => Number(raw).toFixed(2) },
+  { input: ui.splitTopK, value: ui.splitTopKValue, format: (raw) => String(Math.round(Number(raw))) },
 ];
 
 export {

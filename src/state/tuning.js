@@ -12,6 +12,7 @@ import {
   runConvergedOptimizationWithEdgeOptimization,
   runFinalAdmmCompletion,
   runSgdIteration,
+  runFixedStructureAdmmBlock,
 } from "../solver/optimizers.js";
 import { createBaseState, initializeTuningLoopState, optimizerLabel, resetAdmmVariables, syncStateParams } from "./base.js";
 
@@ -30,6 +31,7 @@ function createSimulationRuntime(baseState) {
       mu: { value: String(baseState.mu) },
       rho: { value: String(baseState.rho) },
       stationCost: { value: String(baseState.stationCost) },
+      splitTopK: { value: String(baseState.splitTopK ?? 1) },
     },
   };
 }
@@ -40,6 +42,7 @@ function simulateFixedHubRefinement(baseState, x, edges) {
   state.mu = baseState.mu;
   state.rho = baseState.rho;
   state.stationCost = baseState.stationCost;
+  state.splitTopK = baseState.splitTopK;
   const convergence = runConvergedOptimizationWithEdgeOptimization(state, resetAdmmVariables, {
     pushHistory: false,
     graphMode: "knn",
@@ -53,6 +56,7 @@ function simulateFinalCompletion(baseState, x, edges) {
   state.mu = baseState.mu;
   state.rho = baseState.rho;
   state.stationCost = baseState.stationCost;
+  state.splitTopK = baseState.splitTopK;
   const completion = runFinalAdmmCompletion(state);
   return { state, metrics: completion.metrics, completion };
 }
@@ -231,48 +235,49 @@ function advanceTuningConvergencePhase(state) {
 function buildSplitProposal(state) {
   const currentEval = evaluateObjective(state.x, state.edges, state.cloud, state);
   const clusterEnergies = computeClusterEnergies(currentEval.assignments, state.x);
-  let clusterIndex = -1;
-  let bestEnergy = -Infinity;
+  const candidateClusters = [];
   for (let i = 0; i < clusterEnergies.length; i += 1) {
     if (currentEval.assignments[i].length < 2) {
       continue;
     }
-    if (clusterEnergies[i] > bestEnergy) {
-      bestEnergy = clusterEnergies[i];
-      clusterIndex = i;
-    }
+    candidateClusters.push({ clusterIndex: i, clusterEnergy: clusterEnergies[i] });
   }
-  if (clusterIndex === -1) {
+  if (candidateClusters.length === 0) {
     return null;
   }
 
-  const clusterPoints = currentEval.assignments[clusterIndex];
-  const splitSeed = state.outerIteration + clusterIndex * 19 + state.x.length * 7;
-  const split = kMeans(clusterPoints, 2, 12, splitSeed);
-  if (split.centers.length < 2) {
-    return null;
-  }
+  candidateClusters.sort((a, b) => b.clusterEnergy - a.clusterEnergy);
+  const topClusters = candidateClusters.slice(0, Math.max(1, state.splitTopK ?? 1));
 
   let best = null;
-  for (const candidate of split.centers) {
-    const proposalHubs = clonePoints(state.x);
-    proposalHubs.push(candidate);
-    const candidateIndex = proposalHubs.length - 1;
+  for (const { clusterIndex, clusterEnergy } of topClusters) {
+    const clusterPoints = currentEval.assignments[clusterIndex];
+    const splitSeed = state.outerIteration + clusterIndex * 19 + state.x.length * 7;
+    const split = kMeans(clusterPoints, 2, 12, splitSeed);
+    if (split.centers.length < 2) {
+      continue;
+    }
 
-    for (let anchorIndex = 0; anchorIndex < state.x.length; anchorIndex += 1) {
-      const proposalEdges = canonicalizeEdges(state.edges.concat([[anchorIndex, candidateIndex]]));
-      const simulation = simulateFixedHubRefinement(state, proposalHubs, proposalEdges);
-      const delta = currentEval.objective - simulation.metrics.objective;
+    for (const candidate of split.centers) {
+      const proposalHubs = clonePoints(state.x);
+      proposalHubs.push(candidate);
+      const candidateIndex = proposalHubs.length - 1;
 
-      if (!best || delta > best.delta) {
-        best = {
-          delta,
-          clusterIndex,
-          clusterEnergy: bestEnergy,
-          candidate,
-          anchorIndex,
-          simulation,
-        };
+      for (let anchorIndex = 0; anchorIndex < state.x.length; anchorIndex += 1) {
+        const proposalEdges = canonicalizeEdges(state.edges.concat([[anchorIndex, candidateIndex]]));
+        const simulation = simulateFixedHubRefinement(state, proposalHubs, proposalEdges);
+        const delta = currentEval.objective - simulation.metrics.objective;
+
+        if (!best || delta > best.delta) {
+          best = {
+            delta,
+            clusterIndex,
+            clusterEnergy,
+            candidate,
+            anchorIndex,
+            simulation,
+          };
+        }
       }
     }
   }
@@ -298,7 +303,7 @@ function stepExplorerState(state, runtime) {
   if (state.optimizer === "sgd") {
     runSgdIteration(state, "knn", true);
   } else {
-    runAdmmIteration(state, "knn", true);
+    runFixedStructureAdmmBlock(state, 4, true);
   }
 }
 
@@ -342,18 +347,34 @@ function stepTuningState(state, runtime) {
 
       const splitProposal = buildSplitProposal(state);
       if (splitProposal && splitProposal.delta > 0) {
-        adoptSimulationState(
-          state,
-          splitProposal.simulation,
-          `Added hub from Voronoi split ${splitProposal.clusterIndex} via ${splitProposal.anchorIndex} (dF=${splitProposal.delta.toFixed(3)})`,
+        const acceptedCompletion = simulateFinalCompletion(
+          splitProposal.simulation.state,
+          clonePoints(splitProposal.simulation.state.x),
+          canonicalizeEdges(splitProposal.simulation.state.edges),
         );
-        startTuningConvergencePhase(state, "settling", "regular", "knn", "prepareAcceptedFinalization", {
-          acceptance: {
-            clusterIndex: splitProposal.clusterIndex,
-            anchorIndex: splitProposal.anchorIndex,
-            splitDelta: splitProposal.delta,
-          },
-        });
+        const baselineFinalObjective = state.tuningBaseline?.finalObjective ?? Infinity;
+        if (acceptedCompletion.metrics.objective + 1e-6 < baselineFinalObjective) {
+          adoptSimulationState(
+            state,
+            acceptedCompletion,
+            `Added hub from Voronoi split ${splitProposal.clusterIndex} via ${splitProposal.anchorIndex}; final dF=${(
+              baselineFinalObjective - acceptedCompletion.metrics.objective
+            ).toFixed(3)}`,
+          );
+          commitAcceptedTuningState(state, acceptedCompletion.completion);
+          state.tuningPhase = "cycleStart";
+          state.tuningPhaseData = null;
+          state.tuningBaseline = null;
+          state.tuningAcceptedContext = null;
+          return;
+        }
+
+        state.tuningAcceptedContext = {
+          rejectedObjective: acceptedCompletion.metrics.objective,
+          baselineFinalObjective,
+        };
+        startTuningConvergencePhase(state, "finalizing", "final", "knn", "completeRejectedSplit");
+        state.lastAction = `Rejected hub split at outer step ${state.outerIteration}; final ${solverName} objective rose from ${baselineFinalObjective.toFixed(3)} to ${acceptedCompletion.metrics.objective.toFixed(3)}; running final ${solverName} cleanup`;
         if (animateSolver) {
           return;
         }
@@ -389,6 +410,22 @@ function stepTuningState(state, runtime) {
         : `final ${solverName} hit the step cap after ${completion?.iterations ?? 0} steps`;
       state.lastAction = `No improving hub split after ${settleLabel} at outer step ${state.outerIteration}; ${completionLabel}`;
       state.tuningPhase = "done";
+      state.playing = false;
+      return;
+    }
+
+    if (state.tuningPhase === "completeRejectedSplit") {
+      const completion = state.tuningLastConvergence;
+      commitAcceptedTuningState(state, completion);
+      const completionLabel = completion?.settled
+        ? `final ${solverName} completed in ${completion.iterations} steps`
+        : `final ${solverName} hit the step cap after ${completion?.iterations ?? 0} steps`;
+      const baselineFinalObjective = state.tuningAcceptedContext?.baselineFinalObjective ?? Infinity;
+      const rejectedObjective = state.tuningAcceptedContext?.rejectedObjective ?? Infinity;
+      state.lastAction = `Rejected hub split at outer step ${state.outerIteration}; final ${solverName} objective rose from ${baselineFinalObjective.toFixed(3)} to ${rejectedObjective.toFixed(3)}; ${completionLabel}`;
+      state.tuningPhase = "done";
+      state.tuningPhaseData = null;
+      state.tuningAcceptedContext = null;
       state.playing = false;
       return;
     }

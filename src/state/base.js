@@ -3,7 +3,7 @@ import { buildMaxGraph, canonicalizeEdges } from "../core/graph.js";
 import { clonePoints, mulberry32, vec } from "../core/math.js";
 
 const sgdDefaults = {
-  learningRate: 0.003,
+  learningRate: 1e-6,
   decay: 0.04,
   batchSize: 160,
   pairSamples: 12,
@@ -23,6 +23,7 @@ function syncStateParams(state, ui, optimizationMethod) {
   state.lambda = Number(ui.lambda.value);
   state.mu = Number(ui.mu.value);
   state.stationCost = Number(ui.stationCost.value);
+  state.splitTopK = Math.max(1, Math.round(Number(ui.splitTopK.value)));
   state.optimizer = optimizationMethod;
 }
 
@@ -51,6 +52,7 @@ function createBaseState(mode, cloud, x, edges, runtime) {
     mu: Number(runtime.ui.mu.value),
     rho: Number(runtime.ui.rho.value),
     stationCost: Number(runtime.ui.stationCost.value),
+    splitTopK: Math.max(1, Math.round(Number(runtime.ui.splitTopK.value))),
     sgdLearningRate: sgdDefaults.learningRate,
     sgdDecay: sgdDefaults.decay,
     sgdBatchSize: sgdDefaults.batchSize,

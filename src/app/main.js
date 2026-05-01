@@ -252,6 +252,10 @@ function updateUi(runtime) {
     runtime.optimizationMethod !== "admm" ||
       (runtime.activeMode !== "tuning" && !(runtime.activeMode === "canvas" && runtime.canvasSolveMode === "tuning")),
   );
+  ui.splitTopKGroup.classList.toggle(
+    "is-hidden",
+    runtime.activeMode !== "tuning" && !(runtime.activeMode === "canvas" && runtime.canvasSolveMode === "tuning"),
+  );
   ui.hubCountGroup.classList.toggle(
     "is-hidden",
     runtime.activeMode === "tuning" || (runtime.activeMode === "canvas" && runtime.canvasSolveMode === "tuning"),
@@ -441,7 +445,7 @@ function bindEvents(runtime) {
     updateUi(runtime);
   });
 
-  for (const slider of [ui.hubCount, ui.rho, ui.lambda, ui.mu, ui.stationCost]) {
+  for (const slider of [ui.hubCount, ui.rho, ui.lambda, ui.mu, ui.stationCost, ui.splitTopK]) {
     slider.addEventListener("input", () => {
       syncSliderLabels();
     });
