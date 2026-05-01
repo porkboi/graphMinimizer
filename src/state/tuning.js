@@ -7,6 +7,7 @@ import {
   computeMotionStats,
   computeResidualThresholds,
   optimizeEdgesForState,
+  recordHistory,
   runAdmmIteration,
   runConvergedOptimizationWithEdgeOptimization,
   runFinalAdmmCompletion,
@@ -128,11 +129,11 @@ function runSingleTuningConvergenceIteration(state) {
   let latest;
   let motion = null;
   if (state.optimizer === "sgd") {
-    latest = runSgdIteration(state, data.graphMode, true, data.fixedEdges);
+    latest = runSgdIteration(state, data.graphMode, false, data.fixedEdges);
     motion = latest.motion;
   } else {
     const previousX = clonePoints(state.x);
-    latest = runAdmmIteration(state, data.graphMode, true, data.fixedEdges);
+    latest = runAdmmIteration(state, data.graphMode, false, data.fixedEdges);
     motion = computeMotionStats(state.x, previousX);
   }
 
@@ -156,6 +157,13 @@ function runSingleTuningConvergenceIteration(state) {
 
   state.tuningLastConvergence = result;
   return { result, finished };
+}
+
+function commitAcceptedTuningState(state, result) {
+  if (!result?.metrics) {
+    return;
+  }
+  recordHistory(state, result.metrics, result.primal, result.dual);
 }
 
 function captureTuningBaseline(state, baselineFinalObjective) {
@@ -213,6 +221,9 @@ function advanceTuningConvergencePhase(state) {
         ? edgeOptimization
         : { improved: false, removedEdges: data.removedEdges ?? 0 },
   };
+  if (data.nextPhase === "evaluateSplit") {
+    commitAcceptedTuningState(state, state.tuningLastConvergence);
+  }
   state.tuningPhase = data.nextPhase;
   state.tuningPhaseData = null;
 }
@@ -371,6 +382,7 @@ function stepTuningState(state, runtime) {
 
     if (state.tuningPhase === "completeNoSplit") {
       const completion = state.tuningLastConvergence;
+      commitAcceptedTuningState(state, completion);
       const settleLabel = completion?.settled ? "settled" : `hit the ${solverName} step cap`;
       const completionLabel = completion?.settled
         ? `final ${solverName} completed in ${completion.iterations} steps`
@@ -385,6 +397,7 @@ function stepTuningState(state, runtime) {
       const completion = state.tuningLastConvergence;
       const baselineFinalObjective = state.tuningBaseline?.finalObjective ?? Infinity;
       if (completion.metrics.objective + 1e-6 < baselineFinalObjective || state.forceStop) {
+        commitAcceptedTuningState(state, completion);
         const edgeNote = state.tuningAcceptedContext?.edgeOptimization?.improved
           ? `; pruned ${state.tuningAcceptedContext.edgeOptimization.removedEdges} edges after convergence`
           : "";

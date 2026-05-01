@@ -1,4 +1,4 @@
-import { randomSeed } from "../core/cloud.js";
+import { defaultCloudBounds, randomSeed, seededPointCloud, uniformPointCloud } from "../core/cloud.js";
 import { clamp } from "../core/math.js";
 import { drawChart, drawScene, camera, getSceneBounds, unprojectPoint } from "../render/canvas.js";
 import { createCanvasState, createExplorerState, createTuningState, optimizerLabel } from "../state/base.js";
@@ -20,6 +20,15 @@ function createRuntime() {
     activeMode: "explorer",
     currentCloudSeed: 12,
     customCloud: [],
+    pointCloudSource: {
+      type: "seeded",
+      label: "Seeded clusters",
+      seed: 12,
+      points: seededPointCloud(12),
+    },
+    motionEnabled: false,
+    motionStepMs: 150,
+    pointVelocities: [],
     canvasSolveMode: "explorer",
     optimizationMethod: "admm",
     showVoronoiOverlay: false,
@@ -29,6 +38,85 @@ function createRuntime() {
     canvasState: null,
     ui,
   };
+}
+
+function buildPointVelocities(points, seed = randomSeed()) {
+  let state = seed >>> 0;
+  const nextRandom = () => {
+    state = (1664525 * state + 1013904223) >>> 0;
+    return state / 4294967296;
+  };
+  return points.map(() => {
+    const angle = nextRandom() * Math.PI * 2;
+    const speed = 0.004 + nextRandom() * 0.012;
+    return { x: Math.cos(angle) * speed, y: Math.sin(angle) * speed };
+  });
+}
+
+function syncGeneratedSourceState(runtime) {
+  hydrateStates(runtime);
+  if (runtime.activeMode !== "canvas") {
+    resetState(runtime, runtime.activeMode);
+    return;
+  }
+  updateUi(runtime);
+}
+
+function setPointCloudSource(runtime, source) {
+  runtime.pointCloudSource = source;
+  runtime.pointVelocities = buildPointVelocities(source.points, source.seed + source.points.length * 13);
+  if (runtime.activeMode === "canvas") {
+    runtime.activeMode = "explorer";
+  }
+  syncGeneratedSourceState(runtime);
+}
+
+function spawnUniformCloud(runtime, count) {
+  const seed = randomSeed();
+  setPointCloudSource(runtime, {
+    type: "uniform",
+    label: `Uniform ${count}`,
+    seed,
+    points: uniformPointCloud(count, seed, defaultCloudBounds),
+  });
+}
+
+function resetSeededCloud(runtime) {
+  const seed = randomSeed();
+  runtime.currentCloudSeed = seed;
+  setPointCloudSource(runtime, {
+    type: "seeded",
+    label: "Seeded clusters",
+    seed,
+    points: seededPointCloud(seed),
+  });
+}
+
+function advanceGeneratedCloudMotion(runtime) {
+  if (!runtime.motionEnabled || runtime.activeMode === "canvas" || !runtime.pointCloudSource?.points?.length) {
+    return;
+  }
+
+  const points = runtime.pointCloudSource.points;
+  if (runtime.pointVelocities.length !== points.length) {
+    runtime.pointVelocities = buildPointVelocities(points, runtime.pointCloudSource.seed + points.length * 13);
+  }
+
+  for (let i = 0; i < points.length; i += 1) {
+    const point = points[i];
+    const velocity = runtime.pointVelocities[i];
+    point.x += velocity.x;
+    point.y += velocity.y;
+
+    if (point.x <= defaultCloudBounds.minX || point.x >= defaultCloudBounds.maxX) {
+      velocity.x *= -1;
+      point.x = clamp(point.x, defaultCloudBounds.minX, defaultCloudBounds.maxX);
+    }
+    if (point.y <= defaultCloudBounds.minY || point.y >= defaultCloudBounds.maxY) {
+      velocity.y *= -1;
+      point.y = clamp(point.y, defaultCloudBounds.minY, defaultCloudBounds.maxY);
+    }
+  }
 }
 
 function getActiveState(runtime) {
@@ -171,6 +259,12 @@ function updateUi(runtime) {
   ui.randomizeButton.textContent = runtime.activeMode === "canvas" ? "Clear Canvas" : "Randomise";
   ui.voronoiToggle.textContent = runtime.showVoronoiOverlay ? "Hide Voronoi" : "Show Voronoi";
   ui.voronoiToggle.classList.toggle("is-active", runtime.showVoronoiOverlay);
+  ui.motionToggle.textContent = runtime.motionEnabled ? "Stop Motion" : "Start Motion";
+  ui.motionToggle.classList.toggle("is-active", runtime.motionEnabled);
+  ui.citySimulation.classList.toggle("is-active", runtime.pointCloudSource?.type === "seeded");
+  ui.uniform256.classList.toggle("is-active", runtime.pointCloudSource?.type === "uniform" && runtime.pointCloudSource.points.length === 256);
+  ui.uniform768.classList.toggle("is-active", runtime.pointCloudSource?.type === "uniform" && runtime.pointCloudSource.points.length === 768);
+  ui.uniform1536.classList.toggle("is-active", runtime.pointCloudSource?.type === "uniform" && runtime.pointCloudSource.points.length === 1536);
   sceneCanvas.classList.toggle("is-editable", runtime.activeMode === "canvas");
 
   if (state.mode === "tuning") {
@@ -186,8 +280,8 @@ function updateUi(runtime) {
   } else {
     ui.weightLabel.textContent = "Largest hub weight";
     ui.weightValue.textContent = String(current.maxWeight);
-    ui.pathLabel.textContent = "Highlighted path";
-    ui.pathValue.textContent = `${state.highlightedPair[0]} -> ${state.highlightedPair[1]}`;
+    ui.pathLabel.textContent = "Cloud / path";
+    ui.pathValue.textContent = `${runtime.pointCloudSource?.label ?? "Seeded"}; ${state.highlightedPair[0]} -> ${state.highlightedPair[1]}`;
   }
 
   drawScene(state, { sceneCanvas, sceneCtx, showVoronoiOverlay: runtime.showVoronoiOverlay });
@@ -237,9 +331,11 @@ function randomizeCloud(runtime, mode = runtime.activeMode) {
     updateUi(runtime);
     return;
   }
-  runtime.currentCloudSeed = randomSeed();
-  hydrateStates(runtime);
-  resetState(runtime, mode);
+  if (runtime.pointCloudSource?.type === "uniform") {
+    spawnUniformCloud(runtime, runtime.pointCloudSource.points.length);
+    return;
+  }
+  resetSeededCloud(runtime);
 }
 
 function switchMode(runtime, mode) {
@@ -289,6 +385,14 @@ function bindEvents(runtime) {
   ui.randomizeButton.addEventListener("click", () => randomizeCloud(runtime, runtime.activeMode));
   ui.voronoiToggle.addEventListener("click", () => {
     runtime.showVoronoiOverlay = !runtime.showVoronoiOverlay;
+    updateUi(runtime);
+  });
+  ui.citySimulation.addEventListener("click", () => resetSeededCloud(runtime));
+  ui.uniform256.addEventListener("click", () => spawnUniformCloud(runtime, 256));
+  ui.uniform768.addEventListener("click", () => spawnUniformCloud(runtime, 768));
+  ui.uniform1536.addEventListener("click", () => spawnUniformCloud(runtime, 1536));
+  ui.motionToggle.addEventListener("click", () => {
+    runtime.motionEnabled = !runtime.motionEnabled;
     updateUi(runtime);
   });
   ui.optimizerAdmm.addEventListener("click", () => setOptimizationMethod(runtime, "admm"));
@@ -363,8 +467,9 @@ function bindEvents(runtime) {
 function startAnimation(runtime) {
   let lastTick = 0;
   function animate(timestamp) {
-    if (timestamp - lastTick > 150) {
+    if (timestamp - lastTick > runtime.motionStepMs) {
       const state = getActiveState(runtime);
+      advanceGeneratedCloudMotion(runtime);
       if (state.playing) {
         stepActive(runtime);
       }

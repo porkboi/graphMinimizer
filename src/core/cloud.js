@@ -1,5 +1,12 @@
 import { add, average, clonePoints, mulberry32, randomNormal, squaredDist, vec } from "./math.js";
 
+const defaultCloudBounds = {
+  minX: -2.4,
+  maxX: 2.4,
+  minY: -2.1,
+  maxY: 2.1,
+};
+
 function seededPointCloud(seed = 12) {
   const rng = mulberry32(seed);
   const points = [];
@@ -33,6 +40,20 @@ function seededPointCloud(seed = 12) {
 
 function randomSeed() {
   return Math.floor(Math.random() * 4294967296);
+}
+
+function uniformPointCloud(count, seed = 12, bounds = defaultCloudBounds) {
+  const rng = mulberry32(seed);
+  const points = [];
+  for (let i = 0; i < count; i += 1) {
+    points.push(
+      vec(
+        bounds.minX + rng() * (bounds.maxX - bounds.minX),
+        bounds.minY + rng() * (bounds.maxY - bounds.minY),
+      ),
+    );
+  }
+  return points;
 }
 
 function farthestPointSampling(points, count, seed = 77) {
@@ -111,10 +132,12 @@ function kMeans(points, k, iterations = 12, seed = 91, initialCenters = null) {
 }
 
 export {
+  defaultCloudBounds,
   farthestPointSampling,
   kMeans,
   nearestCenterIndex,
   randomSeed,
   sampleInitialHubs,
   seededPointCloud,
+  uniformPointCloud,
 };

@@ -82,15 +82,19 @@ function initializeTuningLoopState(state, lastAction) {
   state.lastAction = lastAction;
 }
 
+function getRuntimeCloud(runtime) {
+  return runtime.pointCloudSource?.points ?? seededPointCloud(runtime.currentCloudSeed);
+}
+
 function createExplorerState(runtime) {
-  const cloud = seededPointCloud(runtime.currentCloudSeed);
+  const cloud = getRuntimeCloud(runtime);
   const hubCount = Number(runtime.ui.hubCount.value);
   const x = sampleInitialHubs(cloud, hubCount);
   return createBaseState("explorer", cloud, x, [], runtime);
 }
 
 function createTuningState(runtime) {
-  const cloud = seededPointCloud(runtime.currentCloudSeed);
+  const cloud = getRuntimeCloud(runtime);
   const startK = 3;
   const clustering = kMeans(cloud, startK, 16, 111);
   const graph = buildMaxGraph(clustering.centers);

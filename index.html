@@ -84,6 +84,18 @@
               <button id="voronoiToggle" class="ghost" type="button">Show Voronoi</button>
             </div>
             <div class="solver-toggle">
+              <span class="solver-toggle-label">Synthetic clouds</span>
+              <div class="solver-toggle-buttons" role="group" aria-label="Synthetic point clouds">
+                <button id="citySimulation" class="solver-mode ghost" type="button">City Simulation</button>
+                <button id="uniform256" class="solver-mode ghost" type="button">Uniform 256</button>
+                <button id="uniform768" class="solver-mode ghost" type="button">Uniform 768</button>
+                <button id="uniform1536" class="solver-mode ghost" type="button">Uniform 1536</button>
+              </div>
+            </div>
+            <div class="button-row">
+              <button id="motionToggle" class="ghost" type="button">Start Motion</button>
+            </div>
+            <div class="solver-toggle">
               <span class="solver-toggle-label">Optimization method</span>
               <div class="solver-toggle-buttons" role="group" aria-label="Optimization method">
                 <button id="optimizerAdmm" class="solver-mode is-active" type="button">ADMM</button>

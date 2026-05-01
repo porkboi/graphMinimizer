@@ -1,6 +1,103 @@
 import { buildKnnGraph, buildCompleteGraph, canonicalizeEdges, dijkstra, graphFromEdges, isGraphConnected, reconstructPath } from "../core/graph.js";
 import { assignPoints, computeClusterEnergies, evaluateObjective } from "../core/objective.js";
-import { add, clonePoints, dist, norm, normalize, scale, sub, vec } from "../core/math.js";
+import { add, clonePoints, dist, scale, sub, vec } from "../core/math.js";
+
+function dotPoints(a, b) {
+  let total = 0;
+  for (let i = 0; i < a.length; i += 1) {
+    total += a[i].x * b[i].x + a[i].y * b[i].y;
+  }
+  return total;
+}
+
+function pointVectorNorm(points) {
+  return Math.sqrt(Math.max(dotPoints(points, points), 0));
+}
+
+function solveConjugateGradient(applyOperator, rhs, tolerance = 1e-6, maxIterations = 128) {
+  let x = rhs.map(() => vec(0, 0));
+  let residual = clonePoints(rhs);
+  let direction = clonePoints(residual);
+  let residualNormSq = dotPoints(residual, residual);
+
+  if (residualNormSq <= tolerance * tolerance) {
+    return x;
+  }
+
+  for (let iteration = 0; iteration < maxIterations; iteration += 1) {
+    const applied = applyOperator(direction);
+    const denom = Math.max(dotPoints(direction, applied), 1e-12);
+    const alpha = residualNormSq / denom;
+    x = x.map((point, index) => add(point, scale(direction[index], alpha)));
+    residual = residual.map((point, index) => sub(point, scale(applied[index], alpha)));
+    const nextResidualNormSq = dotPoints(residual, residual);
+    if (nextResidualNormSq <= tolerance * tolerance) {
+      return x;
+    }
+    const beta = nextResidualNormSq / Math.max(residualNormSq, 1e-12);
+    direction = residual.map((point, index) => add(point, scale(direction[index], beta)));
+    residualNormSq = nextResidualNormSq;
+  }
+
+  return x;
+}
+
+function applyWeightedLaplacian(points, edgeWeights) {
+  const result = points.map(() => vec(0, 0));
+  for (const { a, b, weight } of edgeWeights) {
+    const delta = sub(points[a], points[b]);
+    result[a] = add(result[a], scale(delta, weight));
+    result[b] = sub(result[b], scale(delta, weight));
+  }
+  return result;
+}
+
+function solveQuadraticProx(v, rho, edgeWeights) {
+  if (v.length === 0) {
+    return [];
+  }
+  if (edgeWeights.length === 0) {
+    return clonePoints(v);
+  }
+
+  const rhs = v.map((point) => scale(point, rho));
+  const applyOperator = (points) => {
+    const laplacian = applyWeightedLaplacian(points, edgeWeights);
+    return points.map((point, index) => add(scale(point, rho), scale(laplacian[index], 2)));
+  };
+
+  return solveConjugateGradient(applyOperator, rhs, 1e-6, Math.max(64, v.length * 8));
+}
+
+function buildPathEdgeWeights(graph, weights) {
+  const totalMass = Math.max(weights.reduce((sum, value) => sum + value, 0), 1);
+  const edgeWeights = new Map();
+
+  for (let i = 0; i < weights.length; i += 1) {
+    const result = dijkstra(graph.adjacency, i);
+    for (let j = i + 1; j < weights.length; j += 1) {
+      if (!Number.isFinite(result.dist[j])) {
+        continue;
+      }
+      const coeff = 0.5 * (weights[i] * weights[j]) / (totalMass * totalMass);
+      if (coeff <= 0) {
+        continue;
+      }
+      const path = reconstructPath(result.prev, i, j);
+      for (let p = 0; p < path.length - 1; p += 1) {
+        const a = Math.min(path[p], path[p + 1]);
+        const b = Math.max(path[p], path[p + 1]);
+        const key = `${a}-${b}`;
+        edgeWeights.set(key, (edgeWeights.get(key) ?? 0) + coeff);
+      }
+    }
+  }
+
+  return [...edgeWeights.entries()].map(([key, weight]) => {
+    const [a, b] = key.split("-").map(Number);
+    return { a, b, weight };
+  });
+}
 
 function proxX(state) {
   const vPoints = state.x.map((_, i) =>
@@ -19,8 +116,7 @@ function proxX(state) {
     }
     const consensus = add(add(sub(state.z1[i], state.u1[i]), sub(state.z2[i], state.u2[i])), sub(state.z3[i], state.u3[i]));
     const denom = bucket.length + 3 * state.rho;
-    const eta = state.admmEta / Math.sqrt(1 + state.iteration * state.admmDecay);
-    nextX.push(scale(add(sum, scale(consensus, eta)), 1 / Math.max(denom, 1e-6)));
+    nextX.push(scale(add(sum, scale(consensus, state.rho)), 1 / Math.max(denom, 1e-6)));
   }
   return nextX;
 }
@@ -31,88 +127,38 @@ function proxZ2(state) {
 }
 
 function proxZ1(state, graph, weights) {
-  const z = clonePoints(state.z1);
   const v = state.x.map((point, i) => add(point, state.u1[i]));
-  const totalMass = Math.max(weights.reduce((sum, value) => sum + value, 0), 1);
-
-  for (let step = 0; step < 15; step += 1) {
-    const grad = z.map(() => vec(0, 0));
-
-    for (let i = 0; i < z.length; i += 1) {
-      const result = dijkstra(graph.adjacency, i);
-      for (let j = i + 1; j < z.length; j += 1) {
-        if (!Number.isFinite(result.dist[j])) {
-          continue;
-        }
-        const coeff = 0.5 * (weights[i] * weights[j]) / (totalMass * totalMass);
-        const path = reconstructPath(result.prev, i, j);
-        for (let p = 0; p < path.length - 1; p += 1) {
-          const a = path[p];
-          const b = path[p + 1];
-          const delta = sub(z[a], z[b]);
-          const unit = normalize(delta);
-          const eta = state.admmEta / Math.sqrt(1 + state.iteration * state.admmDecay);
-          grad[a] = add(grad[a], scale(unit, eta * coeff));
-          grad[b] = add(grad[b], scale(unit, -eta * coeff));
-        }
-      }
-    }
-
-    for (let i = 0; i < z.length; i += 1) {
-      const proxGrad = add(grad[i], scale(sub(z[i], v[i]), state.rho));
-      z[i] = sub(z[i], scale(proxGrad, 0.12));
-    }
-  }
-
-  return z;
+  const edgeWeights = buildPathEdgeWeights(graph, weights);
+  return solveQuadraticProx(v, state.rho, edgeWeights);
 }
 
 function proxZ3(state, edges) {
-  const z = clonePoints(state.z3);
   const v = state.x.map((point, i) => add(point, state.u3[i]));
-
-  for (let step = 0; step < 15; step += 1) {
-    const grad = z.map(() => vec(0, 0));
-    for (const [a, b] of edges) {
-      const delta = sub(z[a], z[b]);
-      const unit = normalize(delta);
-      const eta = state.admmEta / Math.sqrt(1 + state.iteration * state.admmDecay);
-      grad[a] = add(grad[a], scale(unit, eta));
-      grad[b] = add(grad[b], scale(unit, -eta));
-    }
-    for (let i = 0; i < z.length; i += 1) {
-      const proxGrad = add(grad[i], scale(sub(z[i], v[i]), state.rho));
-      z[i] = sub(z[i], scale(proxGrad, 0.11));
-    }
-  }
-
-  return z;
+  const edgeWeights = edges.map(([a, b]) => ({ a, b, weight: state.mu }));
+  return solveQuadraticProx(v, state.rho, edgeWeights);
 }
 
 function residualSum(a, b) {
-  let total = 0;
+  let totalSq = 0;
   for (let i = 0; i < a.length; i += 1) {
-    total += dist(a[i], b[i]);
+    const delta = sub(a[i], b[i]);
+    totalSq += delta.x * delta.x + delta.y * delta.y;
   }
-  return total;
-}
-
-function pointSetNormSum(points) {
-  let total = 0;
-  for (const point of points) {
-    total += norm(point);
-  }
-  return total;
+  return Math.sqrt(totalSq);
 }
 
 function computeResidualThresholds(state, absTolerance = 0.0005, relTolerance = 0.004) {
   const variableCount = state.x.length * 3;
-  const xNorm = pointSetNormSum(state.x);
-  const zNorm = pointSetNormSum(state.z1) + pointSetNormSum(state.z2) + pointSetNormSum(state.z3);
-  const uNorm = pointSetNormSum(state.u1) + pointSetNormSum(state.u2) + pointSetNormSum(state.u3);
+  const xNorm = pointVectorNorm(state.x);
+  const zNorm = Math.sqrt(
+    pointVectorNorm(state.z1) ** 2 + pointVectorNorm(state.z2) ** 2 + pointVectorNorm(state.z3) ** 2,
+  );
+  const uNorm = Math.sqrt(
+    pointVectorNorm(state.u1) ** 2 + pointVectorNorm(state.u2) ** 2 + pointVectorNorm(state.u3) ** 2,
+  );
   return {
-    primal: absTolerance * variableCount + relTolerance * Math.max(xNorm, zNorm),
-    dual: absTolerance * variableCount + relTolerance * state.rho * uNorm,
+    primal: Math.sqrt(variableCount) * absTolerance + relTolerance * Math.max(Math.sqrt(3) * xNorm, zNorm),
+    dual: Math.sqrt(variableCount) * absTolerance + relTolerance * state.rho * uNorm,
   };
 }
 
@@ -222,9 +268,9 @@ function computeSgdGradient(x, cloud, params, rng, edges = null) {
 
   const graph = edges ? graphFromEdges(x, edges) : buildKnnGraph(x, 2);
   for (const [a, b] of graph.edges) {
-    const unit = normalize(sub(x[a], x[b]));
-    grad[a] = add(grad[a], scale(unit, params.mu));
-    grad[b] = add(grad[b], scale(unit, -params.mu));
+    const delta = sub(x[a], x[b]);
+    grad[a] = add(grad[a], scale(delta, 2 * params.mu));
+    grad[b] = sub(grad[b], scale(delta, 2 * params.mu));
   }
 
   const { weights } = assignPoints(x, cloud);
@@ -249,9 +295,9 @@ function computeSgdGradient(x, cloud, params, rng, edges = null) {
     for (let p = 0; p < path.length - 1; p += 1) {
       const a = path[p];
       const b = path[p + 1];
-      const unit = normalize(sub(x[a], x[b]));
-      grad[a] = add(grad[a], scale(unit, coeff));
-      grad[b] = add(grad[b], scale(unit, -coeff));
+      const delta = sub(x[a], x[b]);
+      grad[a] = add(grad[a], scale(delta, 2 * coeff));
+      grad[b] = sub(grad[b], scale(delta, 2 * coeff));
     }
   }
 

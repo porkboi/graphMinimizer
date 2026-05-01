@@ -1,6 +1,6 @@
 import { nearestCenterIndex } from "./cloud.js";
 import { dijkstra, graphFromEdges, reconstructPath } from "./graph.js";
-import { add, average, dist, normalize, scale, squaredDist, sub, vec } from "./math.js";
+import { add, average, scale, squaredDist, vec } from "./math.js";
 
 function assignPoints(hubs, points) {
   const assignments = Array.from({ length: hubs.length }, () => []);
@@ -37,7 +37,7 @@ function computeG2(z2, lambda) {
 function computeGraphVariation(points, edges, mu) {
   let total = 0;
   for (const [a, b] of edges) {
-    total += mu * dist(points[a], points[b]);
+    total += mu * squaredDist(points[a], points[b]);
   }
   return total;
 }
@@ -64,7 +64,7 @@ function computePathSmoothness(points, weights, graph) {
       }
       let pathPenalty = 0;
       for (let p = 0; p < path.length - 1; p += 1) {
-        pathPenalty += dist(points[path[p]], points[path[p + 1]]);
+        pathPenalty += squaredDist(points[path[p]], points[path[p + 1]]);
       }
       const score = 0.5 * (weights[i] * weights[j]) / (totalMass * totalMass) * pathPenalty;
       smoothness += score;
